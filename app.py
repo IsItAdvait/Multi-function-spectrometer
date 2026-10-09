@@ -15,13 +15,14 @@ import sys
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.exporters import ImageExporter
 from PyQt6.QtCore import (
     QAbstractTableModel,
+    QLocale,
     QMetaObject,
     QModelIndex,
     Qt,
@@ -29,7 +30,7 @@ from PyQt6.QtCore import (
     QTimer,
     Q_ARG,
 )
-from PyQt6.QtGui import QAction, QCloseEvent, QFont, QIcon
+from PyQt6.QtGui import QAction, QCloseEvent, QDoubleValidator, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -37,14 +38,17 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QStatusBar,
     QStyle,
@@ -98,6 +102,197 @@ _CAPTURE_PENS = {
 }
 
 _LIVE_PEN = pg.mkPen(color=(255, 220, 40), width=2)
+
+# Ocean Optics FLAME-class integration-time bounds (microseconds).
+# SeaBreeze applies the total via spectrometer.integration_time_micros().
+_MIN_INTEGRATION_US: int = 1_000
+_MAX_INTEGRATION_MS: int = 10_000
+
+
+class MeasurementCsvError(ValueError):
+    """Raised when an imported measurement CSV cannot be used."""
+
+
+def _header_key(name: str) -> str:
+    return name.strip().lower().replace("µ", "u").replace("μ", "u")
+
+
+def _is_derived_column(header: str) -> bool:
+    key = _header_key(header)
+    return "interp" in key or "_avg" in key or "avg_" in key
+
+
+def _parse_numeric_cell(token: str) -> Optional[float]:
+    text = token.strip()
+    if not text or text.upper() in {"N/A", "NA", "NAN"}:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if math.isnan(value):
+        return None
+    return value
+
+
+def _row_looks_numeric(row: list[str]) -> bool:
+    seen = 0
+    for cell in row:
+        text = cell.strip()
+        if not text:
+            continue
+        if _parse_numeric_cell(text) is None:
+            return False
+        seen += 1
+    return seen > 0
+
+
+def _classify_measurement_column(header: str) -> Optional[tuple[Optional[str], str]]:
+    """Map a CSV header to ``(geometry key or None, slot name)``.
+
+    ``None`` geometry means an unprefixed Baseline/Standard/Sample column,
+    which is applied to the optical mode that is active at import time.
+    Mode-prefixed headers such as ``R0_Baseline (counts)`` target that mode.
+    """
+    if _is_derived_column(header):
+        return None
+    key = _header_key(header)
+    if "wavelength" in key or "intensity" == key:
+        return None
+    for mode_key in OPTICAL_MODE_KEYS:
+        mode_token = mode_key.lower()
+        for slot in CAPTURE_LABELS:
+            slot_token = slot.lower()
+            if (
+                f"{mode_token}_{slot_token}" in key
+                or f"{mode_token} {slot_token}" in key
+                or f"{mode_token}-{slot_token}" in key
+            ):
+                return mode_key, slot
+    for slot in CAPTURE_LABELS:
+        slot_token = slot.lower()
+        if slot_token not in key:
+            continue
+        if any(
+            f"{mode_key.lower()}_" in key
+            or f"{mode_key.lower()} " in key
+            or f"{mode_key.lower()}-" in key
+            for mode_key in OPTICAL_MODE_KEYS
+        ):
+            continue
+        return None, slot
+    return None
+
+
+def parse_unified_measurement_csv(
+    path: Path,
+) -> tuple[np.ndarray, dict[Optional[str], dict[str, np.ndarray]]]:
+    """Load every raw measurement column from one CSV.
+
+    Returns ``(wavelengths, columns)`` where ``columns`` maps an optical-mode
+    key (or ``None`` for unprefixed columns) to slot-name intensity arrays.
+    Average and interpolation columns are ignored.
+    """
+    try:
+        raw_text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise MeasurementCsvError(f"Could not read file: {exc}") from exc
+
+    rows = [
+        row
+        for row in csv.reader(raw_text.splitlines())
+        if any(cell.strip() for cell in row)
+    ]
+    if rows and rows[0] and rows[0][0].strip().lower().startswith("sep="):
+        rows = rows[1:]
+    if not rows:
+        raise MeasurementCsvError("The CSV file is empty.")
+
+    if _row_looks_numeric(rows[0]):
+        width = max(len(row) for row in rows)
+        headers = [f"Column {i + 1}" for i in range(width)]
+        data_rows = rows
+    else:
+        headers = [cell.strip() for cell in rows[0]]
+        data_rows = rows[1:]
+
+    if not data_rows:
+        raise MeasurementCsvError("The CSV file has a header but no data rows.")
+
+    wavelength_index: Optional[int] = None
+    for index, header in enumerate(headers):
+        key = _header_key(header)
+        if "wavelength" in key and not _is_derived_column(header):
+            wavelength_index = index
+            break
+    if wavelength_index is None:
+        for index, header in enumerate(headers):
+            if "wavelength" in _header_key(header):
+                wavelength_index = index
+                break
+    if wavelength_index is None:
+        wavelength_index = 0
+
+    selected: dict[tuple[Optional[str], str], int] = {}
+    for index, header in enumerate(headers):
+        if index == wavelength_index:
+            continue
+        classified = _classify_measurement_column(header)
+        if classified is None or classified in selected:
+            continue
+        selected[classified] = index
+
+    if not selected:
+        available = ", ".join(header for header in headers if header) or "(none)"
+        raise MeasurementCsvError(
+            "No Baseline, Standard, or Sample columns were found.\n"
+            f"Columns in file: {available}"
+        )
+
+    wavelengths: list[float] = []
+    series: dict[tuple[Optional[str], str], list[float]] = {
+        key: [] for key in selected
+    }
+    for row in data_rows:
+        if wavelength_index >= len(row):
+            continue
+        wavelength = _parse_numeric_cell(row[wavelength_index])
+        if wavelength is None:
+            continue
+        parsed: dict[tuple[Optional[str], str], float] = {}
+        missing = False
+        for key, column in selected.items():
+            if column >= len(row):
+                missing = True
+                break
+            value = _parse_numeric_cell(row[column])
+            if value is None:
+                missing = True
+                break
+            parsed[key] = value
+        if missing:
+            continue
+        wavelengths.append(wavelength)
+        for key, value in parsed.items():
+            series[key].append(value)
+
+    if len(wavelengths) < 2:
+        raise MeasurementCsvError(
+            "The file does not contain at least two complete wavelength rows "
+            "for the detected measurement columns."
+        )
+
+    grouped: dict[Optional[str], dict[str, np.ndarray]] = {}
+    for (geometry, slot), values in series.items():
+        grouped.setdefault(geometry, {})[slot] = np.asarray(values, dtype=np.float64)
+    return np.asarray(wavelengths, dtype=np.float64), grouped
+
+
+def _wavelength_axes_match(imported: np.ndarray, reference: np.ndarray) -> bool:
+    """True when both axes have the same length and agree to ~0.05 nm."""
+    if imported.shape != reference.shape:
+        return False
+    return bool(np.allclose(imported, reference, rtol=1e-5, atol=0.05))
 
 
 def _empty_geometry_slot() -> dict[str, Optional[np.ndarray]]:
@@ -243,6 +438,63 @@ def _interpolate_series(
     return _natural_cubic_interpolate(x, v, new_wavelengths)
 
 
+def _interpolate_reflectance_series(
+    wavelengths: np.ndarray,
+    reflectance: np.ndarray,
+    new_wavelengths: np.ndarray,
+    method: str,
+) -> np.ndarray:
+    """Resample reflectance onto ``new_wavelengths``.
+
+    Target points outside the finite reflectance span are clamped to that span
+    so edge NaNs from averaging do not produce an empty or crashing result.
+    """
+    wl = np.asarray(wavelengths, dtype=np.float64)
+    values = np.asarray(reflectance, dtype=np.float64)
+    finite = np.isfinite(wl) & np.isfinite(values)
+    if int(finite.sum()) < 2:
+        raise ValueError(
+            "Reflectance does not have enough finite wavelength points to interpolate."
+        )
+    low = float(np.min(wl[finite]))
+    high = float(np.max(wl[finite]))
+    if high <= low:
+        raise ValueError(
+            "Reflectance does not have enough finite wavelength points to interpolate."
+        )
+    queries = np.clip(np.asarray(new_wavelengths, dtype=np.float64), low, high)
+    return _interpolate_series(wl, values, queries, method)
+
+
+# Denominators at or below this count difference are treated as zero.
+_REFLECTANCE_DENOM_FLOOR = 1e-9
+
+
+def _reflectance_ratio(
+    sample_avg: np.ndarray,
+    baseline_avg: np.ndarray,
+    standard_avg: np.ndarray,
+) -> np.ndarray:
+    """Reflectance = (Sample_avg - Baseline_avg) / (Standard_avg - Baseline_avg).
+
+    Points with a zero or tiny denominator, or any non-finite input, become
+    ``np.nan`` instead of ``inf``.
+    """
+    sample = np.asarray(sample_avg, dtype=np.float64)
+    baseline = np.asarray(baseline_avg, dtype=np.float64)
+    standard = np.asarray(standard_avg, dtype=np.float64)
+    numerator = sample - baseline
+    denominator = standard - baseline
+    with np.errstate(divide="ignore", invalid="ignore"):
+        reflectance = numerator / denominator
+    undefined = (~np.isfinite(reflectance)) | (
+        np.abs(denominator) <= _REFLECTANCE_DENOM_FLOOR
+    )
+    reflectance = np.array(reflectance, dtype=np.float64, copy=True)
+    reflectance[undefined] = np.nan
+    return reflectance
+
+
 def _build_uniform_wavelengths(
     start_wl: float, end_wl: float, step_wl: float, wl_min: float, wl_max: float
 ) -> np.ndarray:
@@ -345,7 +597,7 @@ class SpectrumTableModel(QAbstractTableModel):
             return ""
         value = float(series[row])
         if math.isnan(value):
-            if kind == "avg":
+            if kind in {"avg", "reflectance", "reflectance_interp"}:
                 return "N/A"
             return ""
         return f"{value:.6f}"
@@ -367,6 +619,50 @@ class SpectrumTableModel(QAbstractTableModel):
         idx = self.source_column_index(trace_name)
         return self._columns[idx][1]
 
+    def set_source_trace(self, trace_name: str, values: np.ndarray) -> None:
+        """Replace one raw measurement column without touching averages."""
+        idx = self.source_column_index(trace_name)
+        header, _series, kind = self._columns[idx]
+        array = np.asarray(values, dtype=np.float64)
+        if array.shape != (self._n,):
+            raise ValueError(
+                f"{trace_name} length {array.size} does not match "
+                f"the table length {self._n}"
+            )
+        self._columns[idx] = (header, array, kind)
+        top = self.index(0, idx)
+        bottom = self.index(self._n - 1, idx)
+        self.dataChanged.emit(top, bottom)
+
+    def apply_imported_slots(self, updates: dict[str, np.ndarray]) -> None:
+        """Replace raw slot columns and drop stale average/interpolation columns."""
+        if not updates:
+            return
+        for trace_name, values in updates.items():
+            array = np.asarray(values, dtype=np.float64)
+            if array.shape != (self._n,):
+                raise ValueError(
+                    f"{trace_name} length {array.size} does not match "
+                    f"the table length {self._n}"
+                )
+        self.beginResetModel()
+        kept: list[tuple[str, Optional[np.ndarray], str]] = []
+        for header, series, kind in self._columns:
+            if kind == "wavelength" or kind.startswith("source:"):
+                kept.append((header, series, kind))
+        self._columns = kept
+        for trace_name, values in updates.items():
+            tag = f"source:{trace_name}"
+            for index, (header, _series, kind) in enumerate(self._columns):
+                if kind == tag:
+                    self._columns[index] = (
+                        header,
+                        np.asarray(values, dtype=np.float64),
+                        kind,
+                    )
+                    break
+        self.endResetModel()
+
     def insert_average_adjacent(
         self, trace_name: str, window: int, values: np.ndarray
     ) -> int:
@@ -381,6 +677,78 @@ class SpectrumTableModel(QAbstractTableModel):
         )
         self.endInsertColumns()
         return insert_at
+
+    def latest_average(self, trace_name: str) -> Optional[np.ndarray]:
+        """Return the newest average inserted beside ``trace_name``, if any."""
+        source_idx = self.source_column_index(trace_name)
+        for _header, series, kind in self._columns[source_idx + 1 :]:
+            if str(kind).startswith("source:"):
+                break
+            if kind == "avg" and series is not None:
+                return np.asarray(series, dtype=np.float64)
+        return None
+
+    def set_reflectance(self, values: np.ndarray) -> None:
+        """Append or replace the Reflectance column at the far right."""
+        array = np.asarray(values, dtype=np.float64)
+        if array.shape != (self._n,):
+            raise ValueError(
+                f"Reflectance length {array.size} does not match "
+                f"the table length {self._n}"
+            )
+        header = "Reflectance"
+        idx = self._find_kind_index("reflectance")
+        if idx is None:
+            new_col = self.columnCount()
+            self.beginInsertColumns(QModelIndex(), new_col, new_col)
+            self._columns.append((header, array, "reflectance"))
+            self.endInsertColumns()
+            return
+        self._columns[idx] = (header, array, "reflectance")
+        top = self.index(0, idx)
+        bottom = self.index(self._n - 1, idx)
+        self.dataChanged.emit(top, bottom)
+        self.headerDataChanged.emit(Qt.Orientation.Horizontal, idx, idx)
+
+    def clear_interpolated_reflectance(self) -> None:
+        """Drop resampled reflectance columns after the source ratio changes."""
+        kinds = {"reflectance_interp_wl", "reflectance_interp"}
+        if not any(column[2] in kinds for column in self._columns):
+            return
+        self.beginResetModel()
+        self._columns = [column for column in self._columns if column[2] not in kinds]
+        self.endResetModel()
+
+    def set_interpolated_reflectance(
+        self, wavelengths: np.ndarray, values: np.ndarray
+    ) -> None:
+        """Show the target grid beside Interpolated Reflectance.
+
+        Arrays may be shorter than the raw table; leftover rows stay blank.
+        """
+        wl_vals = np.asarray(wavelengths, dtype=np.float64)
+        reflectance_vals = np.asarray(values, dtype=np.float64)
+        if wl_vals.shape != reflectance_vals.shape or wl_vals.size < 1:
+            raise ValueError(
+                "Interpolated reflectance wavelengths and values must be the same non-empty length."
+            )
+        columns = (
+            ("Reflectance Wavelength (nm)", wl_vals, "reflectance_interp_wl"),
+            ("Interpolated Reflectance", reflectance_vals, "reflectance_interp"),
+        )
+        for header, array, kind in columns:
+            idx = self._find_kind_index(kind)
+            if idx is None:
+                new_col = self.columnCount()
+                self.beginInsertColumns(QModelIndex(), new_col, new_col)
+                self._columns.append((header, array, kind))
+                self.endInsertColumns()
+                continue
+            self._columns[idx] = (header, array, kind)
+            top = self.index(0, idx)
+            bottom = self.index(self._n - 1, idx)
+            self.dataChanged.emit(top, bottom)
+            self.headerDataChanged.emit(Qt.Orientation.Horizontal, idx, idx)
 
     def _find_kind_index(self, kind: str) -> Optional[int]:
         for i, (_header, _series, col_kind) in enumerate(self._columns):
@@ -435,6 +803,39 @@ class SpectrumTableModel(QAbstractTableModel):
                 Qt.Orientation.Horizontal, inten_idx, inten_idx
             )
 
+    def set_interpolation_batch(
+        self, interp_wl: np.ndarray, intensities: dict[str, np.ndarray]
+    ) -> None:
+        """Replace the shared interpolated grid and every supplied trace column.
+
+        Intensity columns follow Baseline, Standard, Sample. Traces omitted from
+        ``intensities`` are dropped so the table stays aligned to this grid.
+        """
+        wl_vals = np.asarray(interp_wl, dtype=np.float64)
+        prepared = {
+            name: np.asarray(values, dtype=np.float64)
+            for name, values in intensities.items()
+        }
+        self.beginResetModel()
+        kept = [
+            column
+            for column in self._columns
+            if column[2] != "interp_wl" and not str(column[2]).startswith("interp:")
+        ]
+        kept.append(("Interp_Wavelength (nm)", wl_vals, "interp_wl"))
+        for trace_name in _SOURCE_TRACES:
+            if trace_name not in prepared:
+                continue
+            kept.append(
+                (
+                    f"{trace_name}_Interp (counts)",
+                    prepared[trace_name],
+                    f"interp:{trace_name}",
+                )
+            )
+        self._columns = kept
+        self.endResetModel()
+
     def export_rows(self) -> tuple[list[str], list[list[str]]]:
         """Return (headers, rows) in current left-to-right visual order."""
         headers = [col[0] for col in self._columns]
@@ -460,16 +861,25 @@ class PostProcessDialog(QDialog):
         standard: Optional[np.ndarray],
         sample: Optional[np.ndarray],
         parent: Optional[QWidget] = None,
+        on_imported: Optional[
+            Callable[
+                [np.ndarray, dict[Optional[str], dict[str, np.ndarray]]],
+                Optional[list[str]],
+            ]
+        ] = None,
     ) -> None:
         super().__init__(parent)
         self._mode_display = mode_display
         self._mode_key = mode_key
+        self._on_imported = on_imported
+        self._reflectance: Optional[np.ndarray] = None
+        self.interpolated_reflectance: Optional[dict[str, np.ndarray]] = None
         self._raw_wavelengths = np.asarray(wavelengths, dtype=np.float64)
         self._wl_min = float(self._raw_wavelengths.min())
         self._wl_max = float(self._raw_wavelengths.max())
         self.setWindowTitle("Post-Processing - Data Viewer")
         self.setModal(True)
-        self.resize(1000, 720)
+        self.resize(1400, 900)
         self.setStyleSheet(
             """
             QDialog {
@@ -511,27 +921,43 @@ class PostProcessDialog(QDialog):
                 background-color: #2a2f3a;
                 border: 1px solid #3d4450;
                 border-radius: 6px;
-                padding: 8px 16px;
-                min-height: 36px;
+                padding: 2px 16px;
+                min-height: 22px;
             }
             QPushButton:hover {
                 background-color: #353b48;
+            }
+            QPushButton:disabled, QToolButton:disabled {
+                color: #6d7480;
             }
             QToolButton {
                 background-color: #2a2f3a;
                 border: 1px solid #3d4450;
                 border-radius: 6px;
-                padding: 8px 16px;
-                min-height: 36px;
+                padding: 2px 12px;
+                min-height: 22px;
                 color: #e8eaed;
             }
             QToolButton:hover {
                 background-color: #353b48;
             }
             QToolButton::menu-indicator {
-                subcontrol-origin: padding;
-                subcontrol-position: center right;
-                padding-right: 4px;
+                image: none;
+                width: 0px;
+            }
+            QPushButton#accentBtn {
+                background-color: #123e4f;
+                border: 1px solid #00bcd4;
+                color: #e8fbff;
+                font-weight: 600;
+            }
+            QPushButton#accentBtn:hover:!disabled {
+                background-color: #16566c;
+                border: 1px solid #00bcd4;
+            }
+            QPushButton#accentBtn:pressed:!disabled {
+                background-color: #0e3340;
+                border: 1px solid #00bcd4;
             }
             QMenu {
                 background-color: #1e2229;
@@ -541,13 +967,16 @@ class PostProcessDialog(QDialog):
             QMenu::item:selected {
                 background-color: #2a4568;
             }
-            QSpinBox, QDoubleSpinBox, QComboBox {
+            QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {
                 background-color: #1e2229;
                 border: 1px solid #3d4450;
                 border-radius: 4px;
                 padding: 4px 8px;
                 min-height: 26px;
                 color: #e8eaed;
+            }
+            QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+                border: 1px solid #00bcd4;
             }
             """
         )
@@ -560,28 +989,40 @@ class PostProcessDialog(QDialog):
             f"Optical mode: {mode_display}  ·  "
             f"{int(self._raw_wavelengths.size)} spectral points"
         )
-        self._summary.setStyleSheet("font-weight: 600;")
-        root.addWidget(self._summary)
+        self._summary.setStyleSheet("font-weight: 600; color: #e8eaed;")
+        self._summary.setWordWrap(True)
+        self._summary.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
 
-        root.addWidget(self._build_interpolation_group())
-        root.addLayout(self._build_average_controls())
+        self._back_btn = QPushButton("Back")
+        self._back_btn.setObjectName("accentBtn")
+        self._back_btn.setMinimumWidth(88)
+        self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._back_btn.setAutoDefault(False)
+        self._back_btn.setDefault(False)
+        self._back_btn.clicked.connect(self.accept)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        header.addWidget(self._summary, stretch=1)
+        header.addWidget(
+            self._back_btn,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+        )
+        root.addLayout(header)
 
         self._model = SpectrumTableModel(
             wavelengths, baseline, standard, sample, parent=self
         )
         self._table = self._make_table_view()
         self._table.setModel(self._model)
-        root.addWidget(self._table, stretch=1)
 
-        button_row = QHBoxLayout()
-        button_row.addStretch(1)
-        self._back_btn = QPushButton("Back")
-        self._back_btn.setMinimumWidth(120)
-        self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._back_btn.setDefault(True)
-        self._back_btn.clicked.connect(self.accept)
-        button_row.addWidget(self._back_btn)
-        root.addLayout(button_row)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addWidget(self._build_sidebar())
+        body.addLayout(self._build_table_pane(), stretch=1)
+        root.addLayout(body, stretch=1)
 
         self._sync_average_buttons(
             baseline is not None,
@@ -594,91 +1035,81 @@ class PostProcessDialog(QDialog):
             sample is not None,
         )
 
-    def _build_interpolation_group(self) -> QGroupBox:
-        group = QGroupBox("Grid Interpolation")
-        layout = QHBoxLayout(group)
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget(self)
+        sidebar.setFixedWidth(268)
+        sidebar.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+        )
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-
-        start_default = float(math.ceil(self._wl_min))
-        end_default = float(math.floor(self._wl_max))
-        if start_default >= end_default:
-            start_default = self._wl_min
-            end_default = self._wl_max
-
-        layout.addWidget(QLabel("Start Wavelength (nm):"))
-        self._start_wl_spin = QDoubleSpinBox()
-        self._start_wl_spin.setDecimals(3)
-        self._start_wl_spin.setRange(self._wl_min, self._wl_max)
-        self._start_wl_spin.setValue(start_default)
-        self._start_wl_spin.setSingleStep(1.0)
-        layout.addWidget(self._start_wl_spin)
-
-        layout.addWidget(QLabel("End Wavelength (nm):"))
-        self._end_wl_spin = QDoubleSpinBox()
-        self._end_wl_spin.setDecimals(3)
-        self._end_wl_spin.setRange(self._wl_min, self._wl_max)
-        self._end_wl_spin.setValue(end_default)
-        self._end_wl_spin.setSingleStep(1.0)
-        layout.addWidget(self._end_wl_spin)
-
-        layout.addWidget(QLabel("Step Size (nm):"))
-        self._step_wl_spin = QDoubleSpinBox()
-        self._step_wl_spin.setDecimals(3)
-        self._step_wl_spin.setRange(0.1, 50.0)
-        self._step_wl_spin.setValue(1.0)
-        self._step_wl_spin.setSingleStep(1.0)
-        layout.addWidget(self._step_wl_spin)
-
-        layout.addWidget(QLabel("Trace:"))
-        self._interp_trace_combo = QComboBox()
-        self._interp_trace_combo.setMinimumWidth(110)
-        layout.addWidget(self._interp_trace_combo)
-
-        layout.addWidget(QLabel("Method:"))
-        self._interp_method_combo = QComboBox()
-        self._interp_method_combo.addItems(["Linear", "Cubic Spline"])
-        self._interp_method_combo.setMinimumWidth(120)
-        layout.addWidget(self._interp_method_combo)
-
-        self._interpolate_btn = QPushButton("Interpolate Grid")
-        self._interpolate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._interpolate_btn.clicked.connect(self._interpolate_grid)
-        layout.addWidget(self._interpolate_btn)
-
+        layout.addWidget(self._build_average_group())
+        layout.addWidget(self._build_interpolation_group())
         layout.addStretch(1)
-        return group
+        return sidebar
 
-    def _populate_interp_trace_combo(
-        self, has_baseline: bool, has_standard: bool, has_sample: bool
-    ) -> None:
-        self._interp_trace_combo.clear()
-        for trace, available in (
-            ("Baseline", has_baseline),
-            ("Standard", has_standard),
-            ("Sample", has_sample),
-        ):
-            if available:
-                self._interp_trace_combo.addItem(trace)
-        self._interpolate_btn.setEnabled(self._interp_trace_combo.count() > 0)
+    def _build_table_pane(self) -> QVBoxLayout:
+        pane = QVBoxLayout()
+        pane.setContentsMargins(0, 0, 0, 0)
+        pane.setSpacing(8)
+        pane.addWidget(self._table, stretch=1)
 
-    def _build_average_controls(self) -> QHBoxLayout:
-        controls = QHBoxLayout()
-        controls.setSpacing(10)
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        bar.addStretch(1)
+        bar.addWidget(self._import_csv_btn)
+        bar.addWidget(self._export_table_btn)
+        pane.addLayout(bar)
+        return pane
 
-        controls.addWidget(QLabel("Window Size (Points):"))
+    def _make_grid_edit(
+        self, default: float, minimum: float, maximum: float, placeholder: str
+    ) -> QLineEdit:
+        edit = QLineEdit(f"{default:.3f}")
+        edit.setPlaceholderText(placeholder)
+        validator = QDoubleValidator(minimum, maximum, 3, edit)
+        validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        validator.setLocale(QLocale.c())
+        edit.setValidator(validator)
+        return edit
+
+    def _field_float(self, edit: QLineEdit) -> float:
+        text = edit.text().strip().replace(",", ".")
+        try:
+            value = float(text)
+        except ValueError as exc:
+            label = edit.placeholderText() or "This field"
+            raise ValueError(f"{label} must be a number.") from exc
+        if not math.isfinite(value):
+            raise ValueError("Wavelength values must be finite.")
+        return value
+
+    def _build_average_group(self) -> QGroupBox:
+        group = QGroupBox("Average")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
+        window_row = QHBoxLayout()
+        window_row.setSpacing(8)
+        window_row.addWidget(QLabel("Window size"))
         self._window_spin = QSpinBox()
         self._window_spin.setRange(2, 50)
         self._window_spin.setValue(5)
         self._window_spin.setSingleStep(1)
-        self._window_spin.setMinimumWidth(80)
-        controls.addWidget(self._window_spin)
+        self._window_spin.setMinimumWidth(72)
+        window_row.addWidget(self._window_spin, stretch=1)
+        layout.addLayout(window_row)
 
         self._avg_menu_btn = QToolButton(self)
-        self._avg_menu_btn.setText("Average Trace")
+        self._avg_menu_btn.setObjectName("avgTraceBtn")
+        self._avg_menu_btn.setText("Average trace ▾")
         self._avg_menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._avg_menu_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self._avg_menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._avg_menu_btn.setMinimumWidth(140)
+        self._avg_menu_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self._avg_menu_btn.setToolTip(
             "Average a single measurement column (inserted beside its source)"
         )
@@ -700,27 +1131,170 @@ class PostProcessDialog(QDialog):
         avg_menu.addAction(self._avg_standard_action)
         avg_menu.addAction(self._avg_sample_action)
         self._avg_menu_btn.setMenu(avg_menu)
-        controls.addWidget(self._avg_menu_btn)
 
         self._avg_all_btn = QPushButton("Average All")
         self._avg_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._avg_all_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self._avg_all_btn.setToolTip(
             "Average Baseline, Standard, and Sample at once "
             "(each result inserted beside its source column)"
         )
         self._avg_all_btn.clicked.connect(self._average_all_traces)
-        controls.addWidget(self._avg_all_btn)
 
-        self._export_table_btn = QPushButton("Export Processed Table (CSV)")
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        action_row.addWidget(self._avg_menu_btn, stretch=1)
+        action_row.addWidget(self._avg_all_btn, stretch=1)
+        layout.addLayout(action_row)
+        return group
+
+    def _build_interpolation_group(self) -> QGroupBox:
+        group = QGroupBox("Interpolation")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
+        start_default = float(math.ceil(self._wl_min))
+        end_default = float(math.floor(self._wl_max))
+        if start_default >= end_default:
+            start_default = self._wl_min
+            end_default = self._wl_max
+
+        self._start_wl_edit = self._make_grid_edit(
+            start_default, self._wl_min, self._wl_max, "Start wavelength (nm)"
+        )
+        self._end_wl_edit = self._make_grid_edit(
+            end_default, self._wl_min, self._wl_max, "End wavelength (nm)"
+        )
+        self._step_wl_edit = self._make_grid_edit(1.0, 0.1, 50.0, "Step size (nm)")
+
+        # Kept so the existing interpolate path can read the selected trace.
+        self._interp_trace_combo = QComboBox(self)
+        self._interp_trace_combo.hide()
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.addRow("Start", self._start_wl_edit)
+        form.addRow("End", self._end_wl_edit)
+        form.addRow("Step size", self._step_wl_edit)
+        self._interp_method_combo = QComboBox()
+        self._interp_method_combo.addItems(["Linear", "Cubic Spline"])
+        form.addRow("Method", self._interp_method_combo)
+        layout.addLayout(form)
+
+        self._interpolate_btn = QToolButton(self)
+        self._interpolate_btn.setText("Interpolate ▾")
+        self._interpolate_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._interpolate_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._interpolate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._interpolate_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._interpolate_btn.setToolTip(
+            "Interpolate Baseline, Standard, or Sample onto this wavelength grid"
+        )
+        interp_menu = QMenu(self._interpolate_btn)
+        self._interp_baseline_action = QAction("Baseline", self)
+        self._interp_standard_action = QAction("Standard", self)
+        self._interp_sample_action = QAction("Sample", self)
+        self._interp_baseline_action.triggered.connect(
+            lambda: self._interpolate_selected("Baseline")
+        )
+        self._interp_standard_action.triggered.connect(
+            lambda: self._interpolate_selected("Standard")
+        )
+        self._interp_sample_action.triggered.connect(
+            lambda: self._interpolate_selected("Sample")
+        )
+        interp_menu.addAction(self._interp_baseline_action)
+        interp_menu.addAction(self._interp_standard_action)
+        interp_menu.addAction(self._interp_sample_action)
+        self._interpolate_btn.setMenu(interp_menu)
+        layout.addWidget(self._interpolate_btn)
+
+        self._interpolate_all_btn = QPushButton("Interpolate all")
+        self._interpolate_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._interpolate_all_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._interpolate_all_btn.setToolTip(
+            "Interpolate Baseline, Standard, and Sample onto this wavelength grid"
+        )
+        self._interpolate_all_btn.clicked.connect(self._interpolate_all)
+        layout.addWidget(self._interpolate_all_btn)
+
+        self._reflectance_btn = QPushButton("Reflectance")
+        self._reflectance_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._reflectance_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._reflectance_btn.setToolTip(
+            "Reflectance = (Sample_avg − Baseline_avg) / "
+            "(Standard_avg − Baseline_avg) at each wavelength"
+        )
+        self._reflectance_btn.clicked.connect(self._calculate_reflectance)
+        layout.addWidget(self._reflectance_btn)
+
+        self._interp_reflectance_btn = QPushButton("Interpolate Reflectance")
+        self._interp_reflectance_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._interp_reflectance_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._interp_reflectance_btn.setToolTip(
+            "Resample reflectance onto the start, end, and step wavelength grid"
+        )
+        self._interp_reflectance_btn.clicked.connect(self._interpolate_reflectance)
+        layout.addWidget(self._interp_reflectance_btn)
+
+        self._export_table_btn = QPushButton("Export")
+        self._export_table_btn.setObjectName("accentBtn")
         self._export_table_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._export_table_btn.setToolTip(
-            "Export all table columns (raw, averages, and interpolation) side-by-side"
+            "Export all table columns, including reflectance and interpolated reflectance"
         )
         self._export_table_btn.clicked.connect(self._export_processed_table)
-        controls.addWidget(self._export_table_btn)
 
-        controls.addStretch(1)
-        return controls
+        self._import_csv_btn = QPushButton("Import")
+        self._import_csv_btn.setObjectName("accentBtn")
+        self._import_csv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_csv_btn.setToolTip(
+            "Load Baseline, Standard, and Sample together from a multi-column CSV"
+        )
+        self._import_csv_btn.clicked.connect(self._import_measurement_csv)
+        return group
+
+    def _interpolate_selected(self, trace_name: str) -> None:
+        """Choose one trace from the Interpolate menu, then run the grid routine."""
+        index = self._interp_trace_combo.findText(trace_name)
+        if index < 0:
+            QMessageBox.warning(
+                self,
+                "No Trace Selected",
+                f"No captured {trace_name} data available to interpolate.",
+            )
+            return
+        self._interp_trace_combo.setCurrentIndex(index)
+        self._interpolate_grid()
+
+    def _populate_interp_trace_combo(
+        self, has_baseline: bool, has_standard: bool, has_sample: bool
+    ) -> None:
+        self._interp_trace_combo.clear()
+        for trace, available in (
+            ("Baseline", has_baseline),
+            ("Standard", has_standard),
+            ("Sample", has_sample),
+        ):
+            if available:
+                self._interp_trace_combo.addItem(trace)
+        has_any = self._interp_trace_combo.count() > 0
+        self._interpolate_btn.setEnabled(has_any)
+        self._interpolate_all_btn.setEnabled(has_any)
+        self._interp_baseline_action.setEnabled(has_baseline)
+        self._interp_standard_action.setEnabled(has_standard)
+        self._interp_sample_action.setEnabled(has_sample)
 
     def _make_table_view(self) -> QTableView:
         table = QTableView(self)
@@ -731,9 +1305,13 @@ class PostProcessDialog(QDialog):
         table.verticalHeader().setVisible(True)
         table.verticalHeader().setDefaultSectionSize(22)
         table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Interactive
+            QHeaderView.ResizeMode.Stretch
         )
+        table.horizontalHeader().setStretchLastSection(True)
         table.setWordWrap(False)
+        table.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         return table
 
@@ -846,13 +1424,7 @@ class PostProcessDialog(QDialog):
             return
 
         try:
-            interp_wl = _build_uniform_wavelengths(
-                self._start_wl_spin.value(),
-                self._end_wl_spin.value(),
-                self._step_wl_spin.value(),
-                self._wl_min,
-                self._wl_max,
-            )
+            interp_wl = self._current_interp_grid()
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid Grid", str(exc))
             return
@@ -879,12 +1451,216 @@ class PostProcessDialog(QDialog):
             f"{self._model.rowCount()} raw rows  ·  "
             f"{interp_wl.size} interpolated {trace_name} points "
             f"({interp_wl[0]:.3f}–{interp_wl[-1]:.3f} nm, "
-            f"step {self._step_wl_spin.value():.3f} nm, {method_key})"
+            f"step {self._field_float(self._step_wl_edit):.3f} nm, {method_key})"
+        )
+
+    def _current_interp_method(self) -> str:
+        method = self._interp_method_combo.currentText()
+        return "Linear" if method == "Linear" else "Cubic Spline"
+
+    def _current_interp_grid(self) -> np.ndarray:
+        return _build_uniform_wavelengths(
+            self._field_float(self._start_wl_edit),
+            self._field_float(self._end_wl_edit),
+            self._field_float(self._step_wl_edit),
+            self._wl_min,
+            self._wl_max,
+        )
+
+    def _interpolate_all(self) -> None:
+        """Interpolate every captured trace onto the current wavelength grid."""
+        present: list[str] = []
+        skipped: list[str] = []
+        for trace_name in _SOURCE_TRACES:
+            if self._model.raw_trace(trace_name) is None:
+                skipped.append(trace_name)
+            else:
+                present.append(trace_name)
+
+        if not present:
+            QMessageBox.warning(
+                self,
+                "No Data",
+                "No captured traces available to interpolate.",
+            )
+            return
+
+        try:
+            interp_wl = self._current_interp_grid()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Grid", str(exc))
+            return
+
+        method_key = self._current_interp_method()
+        results: dict[str, np.ndarray] = {}
+        for trace_name in present:
+            intensities = self._model.raw_trace(trace_name)
+            if intensities is None:
+                skipped.append(trace_name)
+                continue
+            try:
+                results[trace_name] = _interpolate_series(
+                    self._model.wavelengths(),
+                    intensities,
+                    interp_wl,
+                    method_key,
+                )
+            except Exception as exc:
+                logger.exception("Interpolation failed for %s", trace_name)
+                skipped.append(f"{trace_name} ({exc})")
+
+        if not results:
+            QMessageBox.warning(
+                self,
+                "Interpolation Failed",
+                "None of the captured traces could be interpolated.\n"
+                + "\n".join(skipped),
+            )
+            return
+
+        self._model.set_interpolation_batch(interp_wl, results)
+        self._table.resizeColumnsToContents()
+        names = ", ".join(results)
+        self._summary.setText(
+            f"Optical mode: {self._mode_display}  ·  "
+            f"{self._model.rowCount()} raw rows  ·  "
+            f"{interp_wl.size} interpolated points for {names} "
+            f"({interp_wl[0]:.3f}–{interp_wl[-1]:.3f} nm, "
+            f"step {self._field_float(self._step_wl_edit):.3f} nm, {method_key})"
+        )
+        if skipped:
+            missing = [name for name in skipped if name in _SOURCE_TRACES]
+            failed = [name for name in skipped if name not in _SOURCE_TRACES]
+            lines = [f"Interpolated: {names}."]
+            if missing:
+                lines.append(f"Skipped (no data): {', '.join(missing)}.")
+            if failed:
+                lines.append("Skipped (failed): " + "; ".join(failed) + ".")
+            QMessageBox.information(
+                self,
+                "Partial Interpolation",
+                "\n".join(lines),
+            )
+
+    def _averaged_trace(self, trace_name: str) -> Optional[np.ndarray]:
+        """Newest average for one trace, or ``None`` when it is unusable."""
+        raw = self._model.raw_trace(trace_name)
+        averaged = self._model.latest_average(trace_name)
+        if raw is None or averaged is None:
+            return None
+        if averaged.shape != (self._model.rowCount(),):
+            return None
+        if not np.any(np.isfinite(averaged)):
+            return None
+        return averaged
+
+    def _calculate_reflectance(self) -> bool:
+        """Reflectance from averaged Baseline, Standard, and Sample."""
+        averages: dict[str, np.ndarray] = {}
+        missing: list[str] = []
+        for trace_name in _SOURCE_TRACES:
+            averaged = self._averaged_trace(trace_name)
+            if averaged is None:
+                missing.append(trace_name)
+            else:
+                averages[trace_name] = averaged
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Measurements Required",
+                "Reflectance needs averaged Baseline, Standard, and Sample "
+                "data at each wavelength.\n\n"
+                f"Missing or incomplete: {', '.join(missing)}.\n"
+                "Capture or import all three measurements, average them, "
+                "and calculate again.",
+            )
+            return False
+
+        reflectance = _reflectance_ratio(
+            averages["Sample"],
+            averages["Baseline"],
+            averages["Standard"],
+        )
+        try:
+            self._model.set_reflectance(reflectance)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Reflectance Failed", str(exc))
+            return False
+
+        self._model.clear_interpolated_reflectance()
+        self.interpolated_reflectance = None
+        self._reflectance = reflectance.copy()
+        parent = self.parent()
+        store = getattr(parent, "_store_reflectance", None)
+        if callable(store):
+            store(self._mode_key, self._reflectance)
+        clear_interp = getattr(parent, "_store_interpolated_reflectance", None)
+        if callable(clear_interp):
+            clear_interp(self._mode_key, None, None)
+        finite = int(np.isfinite(reflectance).sum())
+        self._summary.setText(
+            f"Optical mode: {self._mode_display}  ·  "
+            f"{self._model.rowCount()} raw rows  ·  "
+            f"Reflectance computed ({finite} finite points)"
+        )
+        return True
+
+    def _interpolate_reflectance(self) -> None:
+        """Resample reflectance onto the configured target wavelength grid."""
+        if self._reflectance is None or not np.any(np.isfinite(self._reflectance)):
+            if not self._calculate_reflectance():
+                return
+        assert self._reflectance is not None
+
+        try:
+            grid = self._current_interp_grid()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Grid", str(exc))
+            return
+
+        method_key = self._current_interp_method()
+        try:
+            resampled = _interpolate_reflectance_series(
+                self._model.wavelengths(),
+                self._reflectance,
+                grid,
+                method_key,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Reflectance Required", str(exc))
+            return
+        except Exception as exc:
+            logger.exception("Reflectance interpolation failed")
+            QMessageBox.critical(self, "Interpolation Failed", str(exc))
+            return
+
+        try:
+            self._model.set_interpolated_reflectance(grid, resampled)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Interpolation Failed", str(exc))
+            return
+
+        self.interpolated_reflectance = {
+            "wavelengths": np.asarray(grid, dtype=np.float64).copy(),
+            "values": np.asarray(resampled, dtype=np.float64).copy(),
+        }
+        parent = self.parent()
+        store = getattr(parent, "_store_interpolated_reflectance", None)
+        if callable(store):
+            store(self._mode_key, grid, resampled)
+        self._table.resizeColumnsToContents()
+        self._summary.setText(
+            f"Optical mode: {self._mode_display}  ·  "
+            f"{self._model.rowCount()} raw rows  ·  "
+            f"{grid.size} interpolated reflectance points "
+            f"({grid[0]:.3f}–{grid[-1]:.3f} nm, "
+            f"step {self._field_float(self._step_wl_edit):.3f} nm, {method_key})"
         )
 
     def _export_processed_table(self) -> None:
         headers, rows = self._model.export_rows()
-        # Ensure every row has exactly one string per column (blank for padded cells).
+        # Every visible column is written, including Reflectance and
+        # Interpolated Reflectance when those calculations have been run.
         col_count = len(headers)
         normalized_rows: list[list[str]] = []
         for row in rows:
@@ -932,6 +1708,75 @@ class PostProcessDialog(QDialog):
             f"Saved processed table to:\n{path}",
         )
 
+    def _refresh_slot_controls(self) -> None:
+        self._sync_average_buttons(
+            self._model.raw_trace("Baseline") is not None,
+            self._model.raw_trace("Standard") is not None,
+            self._model.raw_trace("Sample") is not None,
+        )
+        self._populate_interp_trace_combo(
+            self._model.raw_trace("Baseline") is not None,
+            self._model.raw_trace("Standard") is not None,
+            self._model.raw_trace("Sample") is not None,
+        )
+
+    def _import_measurement_csv(self) -> None:
+        """Import every measurement column and refresh this table."""
+        path_str, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Import CSV Data",
+            str(Path.home()),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+
+        try:
+            imported_wavelengths, columns = parse_unified_measurement_csv(Path(path_str))
+        except MeasurementCsvError as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+            return
+
+        reference = self._model.wavelengths()
+        if not _wavelength_axes_match(imported_wavelengths, reference):
+            QMessageBox.warning(
+                self,
+                "Wavelength Axis Mismatch",
+                "The imported wavelength axis does not match the current "
+                "measurement grid.\n"
+                f"Imported points: {imported_wavelengths.size}\n"
+                f"Current points: {reference.size}\n"
+                "Import a file acquired on this wavelength axis "
+                "(same length and wavelength values).",
+            )
+            return
+
+        loaded: Optional[list[str]] = None
+        if self._on_imported is not None:
+            loaded = self._on_imported(imported_wavelengths, columns)
+            if not loaded:
+                return
+
+        updates: dict[str, np.ndarray] = dict(columns.get(self._mode_key, {}))
+        for slot_name, values in columns.get(None, {}).items():
+            updates.setdefault(slot_name, values)
+        try:
+            self._model.apply_imported_slots(updates)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+            return
+
+        self._reflectance = None
+        self.interpolated_reflectance = None
+        self._refresh_slot_controls()
+        self._table.resizeColumnsToContents()
+        summary = ", ".join(loaded) if loaded else ", ".join(updates)
+        QMessageBox.information(
+            self,
+            "Import Complete",
+            f"Loaded {imported_wavelengths.size} points into: {summary}.",
+        )
+
 
 class SpectrometerApp(QMainWindow):
     """Main window: live spectrum, multi-geometry capture slots, and export."""
@@ -945,6 +1790,7 @@ class SpectrometerApp(QMainWindow):
         self._active_mode: CaptureMode = CaptureMode.BASELINE
         self._device_name: str = "Connecting…"
         self._acquisition_started: bool = False
+        self._integration_syncing: bool = False
         self._latest_wavelengths: Optional[np.ndarray] = None
         self._latest_intensities: Optional[np.ndarray] = None
 
@@ -952,6 +1798,12 @@ class SpectrometerApp(QMainWindow):
         self.spectra_data: dict[str, dict[str, Optional[np.ndarray]]] = (
             _build_spectra_data()
         )
+        self.reflectance_data: dict[str, Optional[np.ndarray]] = {
+            key: None for key in OPTICAL_MODE_KEYS
+        }
+        self.interpolated_reflectance: dict[str, Optional[dict[str, np.ndarray]]] = {
+            key: None for key in OPTICAL_MODE_KEYS
+        }
         # Wavelength axis shared across modes (detector axis is fixed).
         self._wavelengths: Optional[np.ndarray] = None
 
@@ -1086,16 +1938,37 @@ class SpectrometerApp(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(12)
 
-        integ_label = QLabel("Integration time (ms):")
+        integ_label = QLabel("Integration Time:")
         row.addWidget(integ_label)
 
-        self._integration_spin = QSpinBox()
-        self._integration_spin.setRange(1, 10_000)
-        self._integration_spin.setValue(100)
-        self._integration_spin.setSuffix(" ms")
-        self._integration_spin.setMinimumWidth(110)
-        self._integration_spin.valueChanged.connect(self._on_integration_changed)
-        row.addWidget(self._integration_spin)
+        # Milliseconds and microseconds compose one SeaBreeze integration time:
+        # total_micros = (ms * 1000) + us.
+        self._integration_ms_spin = QSpinBox()
+        self._integration_ms_spin.setRange(_MIN_INTEGRATION_US // 1000, _MAX_INTEGRATION_MS)
+        self._integration_ms_spin.setValue(100)
+        self._integration_ms_spin.setSingleStep(1)
+        self._integration_ms_spin.setMinimumWidth(80)
+        self._integration_ms_spin.setToolTip(
+            "Integration time, milliseconds. Combined with microseconds "
+            f"and applied as total µs (minimum {_MIN_INTEGRATION_US} µs)."
+        )
+        self._integration_ms_spin.valueChanged.connect(self._on_integration_changed)
+        row.addWidget(self._integration_ms_spin)
+
+        row.addWidget(QLabel("ms"))
+
+        self._integration_us_spin = QSpinBox()
+        self._integration_us_spin.setRange(0, 999)
+        self._integration_us_spin.setValue(0)
+        self._integration_us_spin.setSingleStep(1)
+        self._integration_us_spin.setMinimumWidth(80)
+        self._integration_us_spin.setToolTip(
+            "Integration time, microseconds (0–999), added to the millisecond field."
+        )
+        self._integration_us_spin.valueChanged.connect(self._on_integration_changed)
+        row.addWidget(self._integration_us_spin)
+
+        row.addWidget(QLabel("µs"))
 
         scans_label = QLabel("Scans to Average:")
         row.addWidget(scans_label)
@@ -1146,6 +2019,17 @@ class SpectrometerApp(QMainWindow):
         self._save_image_btn.setIcon(camera_icon)
         self._save_image_btn.clicked.connect(self._save_plot_image)
         row.addWidget(self._save_image_btn)
+
+        self._import_csv_btn = QPushButton("Import CSV Data")
+        self._import_csv_btn.setObjectName("actionBtn")
+        self._import_csv_btn.setMinimumHeight(40)
+        self._import_csv_btn.setMinimumWidth(170)
+        self._import_csv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_csv_btn.setToolTip(
+            "Load Baseline, Standard, and Sample for the active mode from a CSV file"
+        )
+        self._import_csv_btn.clicked.connect(self._import_csv_data)
+        row.addWidget(self._import_csv_btn)
 
         self._export_btn = QPushButton("Export Data (CSV)")
         self._export_btn.setObjectName("actionBtn")
@@ -1480,9 +2364,158 @@ class SpectrometerApp(QMainWindow):
             3000,
         )
 
+    def _import_csv_data(self) -> None:
+        """Import every measurement column into the active acquisition session."""
+        path_str, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Import CSV Data",
+            str(Path.home()),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            wavelengths, columns = parse_unified_measurement_csv(Path(path_str))
+        except MeasurementCsvError as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+            return
+        loaded = self._store_imported_dataset(wavelengths, columns)
+        if not loaded:
+            return
+        QMessageBox.information(
+            self,
+            "Import Complete",
+            "Loaded "
+            + ", ".join(loaded)
+            + f" ({wavelengths.size} points).\n"
+            "Post Process is available for the imported measurements.",
+        )
+
+    def _occupied_import_targets(
+        self, columns: dict[Optional[str], dict[str, np.ndarray]]
+    ) -> list[str]:
+        occupied: list[str] = []
+        for geometry_key, slots in columns.items():
+            geometry = self._active_geometry if geometry_key is None else geometry_key
+            if geometry not in self.spectra_data:
+                continue
+            for slot_name in slots:
+                if self.spectra_data[geometry][slot_name] is not None:
+                    occupied.append(f"{_display_mode(geometry)} {slot_name}")
+        return occupied
+
+    def _store_imported_dataset(
+        self,
+        wavelengths: np.ndarray,
+        columns: dict[Optional[str], dict[str, np.ndarray]],
+    ) -> Optional[list[str]]:
+        """Store every imported series in the shared capture buffers.
+
+        Unprefixed columns are written to the active optical mode. Returns the
+        loaded labels, or ``None`` when the user cancels a replacement.
+        """
+        imported = np.asarray(wavelengths, dtype=np.float64)
+        if self._wavelengths is not None and not _wavelength_axes_match(
+            imported, self._wavelengths
+        ):
+            QMessageBox.warning(
+                self,
+                "Wavelength Axis Mismatch",
+                "The imported wavelength axis does not match the current "
+                "measurement grid.\n"
+                f"Imported points: {imported.size}\n"
+                f"Current points: {self._wavelengths.size}",
+            )
+            return None
+
+        occupied = self._occupied_import_targets(columns)
+        if occupied:
+            reply = QMessageBox.question(
+                self,
+                "Replace Measurements",
+                "Replace existing captures with the imported file?\n"
+                + ", ".join(occupied),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return None
+
+        if self._wavelengths is None:
+            self._wavelengths = imported.copy()
+
+        loaded: list[str] = []
+        active_prefixed = set(columns.get(self._active_geometry, {}))
+        for geometry_key, slots in columns.items():
+            geometry = self._active_geometry if geometry_key is None else geometry_key
+            if geometry not in self.spectra_data:
+                continue
+            for slot_name, values in slots.items():
+                if slot_name not in CAPTURE_LABELS:
+                    continue
+                if geometry_key is None and slot_name in active_prefixed:
+                    continue
+                array = np.asarray(values, dtype=np.float64)
+                if array.shape != self._wavelengths.shape:
+                    QMessageBox.warning(
+                        self,
+                        "Import Failed",
+                        f"{slot_name} does not match the session wavelength length.",
+                    )
+                    return None
+                self.spectra_data[geometry][slot_name] = array.copy()
+                self.reflectance_data[geometry] = None
+                self.interpolated_reflectance[geometry] = None
+                loaded.append(f"{_display_mode(geometry)} {slot_name}")
+
+        if not loaded:
+            QMessageBox.warning(
+                self,
+                "Import Failed",
+                "None of the CSV columns matched a measurement slot.",
+            )
+            return None
+
+        self._refresh_plot_for_geometry()
+        self._refresh_capture_indicators()
+        self._update_export_enabled()
+        self._update_image_save_enabled()
+        self._update_post_process_enabled()
+        self._refresh_status()
+        self.statusBar().showMessage(
+            "Imported " + ", ".join(loaded),
+            5000,
+        )
+        return loaded
+
+    def _store_reflectance(self, mode_key: str, values: np.ndarray) -> None:
+        """Keep the latest reflectance spectrum for one optical mode."""
+        if mode_key not in self.reflectance_data:
+            return
+        self.reflectance_data[mode_key] = np.asarray(values, dtype=np.float64).copy()
+
+    def _store_interpolated_reflectance(
+        self,
+        mode_key: str,
+        wavelengths: Optional[np.ndarray],
+        values: Optional[np.ndarray],
+    ) -> None:
+        """Keep the resampled reflectance grid for one optical mode."""
+        if mode_key not in self.interpolated_reflectance:
+            return
+        if wavelengths is None or values is None:
+            self.interpolated_reflectance[mode_key] = None
+            return
+        self.interpolated_reflectance[mode_key] = {
+            "wavelengths": np.asarray(wavelengths, dtype=np.float64).copy(),
+            "values": np.asarray(values, dtype=np.float64).copy(),
+        }
+
     def _reset_current_geometry(self) -> None:
         geometry = self._active_geometry
         self.spectra_data[geometry] = _empty_geometry_slot()
+        self.reflectance_data[geometry] = None
+        self.interpolated_reflectance[geometry] = None
         self._refresh_plot_for_geometry()
         self._refresh_capture_indicators()
         self._update_export_enabled()
@@ -1507,6 +2540,8 @@ class SpectrometerApp(QMainWindow):
             return
 
         self.spectra_data = _build_spectra_data()
+        self.reflectance_data = {key: None for key in OPTICAL_MODE_KEYS}
+        self.interpolated_reflectance = {key: None for key in OPTICAL_MODE_KEYS}
         self._refresh_plot_for_geometry()
         self._refresh_capture_indicators()
         self._update_export_enabled()
@@ -1572,19 +2607,51 @@ class SpectrometerApp(QMainWindow):
             standard=slot[CaptureMode.STANDARD.value],
             sample=slot[CaptureMode.SAMPLE.value],
             parent=self,
+            on_imported=self._store_imported_dataset,
         )
         # Modal exec keeps live acquisition running on the worker thread;
         # stored capture arrays are only read, never mutated.
         dialog.exec()
         self._refresh_status()
 
-    def _on_integration_changed(self, value_ms: int) -> None:
-        microseconds = int(value_ms) * 1000
+    def _total_integration_us(self) -> int:
+        """Compose SeaBreeze integration time: ``(ms * 1000) + us``."""
+        return (
+            int(self._integration_ms_spin.value()) * 1000
+            + int(self._integration_us_spin.value())
+        )
+
+    def _apply_integration_fields(self, total_us: int) -> None:
+        """Write a validated total back into the ms/µs fields without re-entry."""
+        total_us = max(_MIN_INTEGRATION_US, min(total_us, _MAX_INTEGRATION_MS * 1000 + 999))
+        ms, us = divmod(int(total_us), 1000)
+        self._integration_syncing = True
+        try:
+            self._integration_ms_spin.setValue(ms)
+            self._integration_us_spin.setValue(us)
+        finally:
+            self._integration_syncing = False
+
+    def _on_integration_changed(self, _value: int = 0) -> None:
+        """Push the combined integration time to the worker as total microseconds."""
+        if self._integration_syncing:
+            return
+
+        total_us = self._total_integration_us()
+        max_us = _MAX_INTEGRATION_MS * 1000 + 999
+        if total_us < _MIN_INTEGRATION_US or total_us > max_us:
+            self._apply_integration_fields(total_us)
+            total_us = self._total_integration_us()
+            self.statusBar().showMessage(
+                f"Integration time adjusted to hardware limits ({total_us} µs)",
+                4000,
+            )
+
         QMetaObject.invokeMethod(
             self._worker,
             "set_integration_time",
             Qt.ConnectionType.QueuedConnection,
-            Q_ARG(int, microseconds),
+            Q_ARG(int, int(total_us)),
         )
 
     def _export_csv(self) -> None:
@@ -1750,7 +2817,7 @@ class SpectrometerApp(QMainWindow):
                     Qt.ConnectionType.QueuedConnection,
                 )
                 # Push current acquisition control values to the worker.
-                self._on_integration_changed(self._integration_spin.value())
+                self._on_integration_changed()
                 QMetaObject.invokeMethod(
                     self._worker,
                     "set_scans_to_average",
