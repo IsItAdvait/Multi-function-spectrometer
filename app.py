@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -48,6 +49,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QStatusBar,
@@ -288,6 +290,158 @@ def parse_unified_measurement_csv(
     return np.asarray(wavelengths, dtype=np.float64), grouped
 
 
+def _load_table_rows(path: Path) -> list[list[str]]:
+    """Read a CSV or Excel sheet as strings, one list per row."""
+    suffix = path.suffix.lower()
+    if suffix in {".xlsx", ".xls"}:
+        try:
+            import pandas as pd
+        except ImportError as exc:
+            raise MeasurementCsvError(
+                "Reading Excel files requires pandas and openpyxl."
+            ) from exc
+        try:
+            frame = pd.read_excel(path, header=None, dtype=object)
+        except Exception as exc:
+            raise MeasurementCsvError(f"Could not read Excel file: {exc}") from exc
+        rows: list[list[str]] = []
+        for record in frame.itertuples(index=False, name=None):
+            converted: list[str] = []
+            for cell in record:
+                if cell is None or pd.isna(cell):
+                    converted.append("")
+                else:
+                    converted.append(str(cell).strip())
+            rows.append(converted)
+        return rows
+
+    try:
+        raw_text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise MeasurementCsvError(f"Could not read file: {exc}") from exc
+    return list(csv.reader(raw_text.splitlines()))
+
+
+def _header_tokens(key: str) -> set[str]:
+    return set(
+        key.replace("_", " ")
+        .replace("-", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .split()
+    )
+
+
+def _silicon_role_scores(key: str) -> dict[str, int]:
+    """Score one header for wavelength, refractive index n, or extinction k."""
+    tokens = _header_tokens(key)
+    scores = {"wl": 0, "n": 0, "k": 0}
+    if "wavelength" in key or "lambda" in key:
+        scores["wl"] = 6
+    elif "wl" in tokens:
+        scores["wl"] = 5
+    elif "nm" in tokens or "(nm)" in key:
+        scores["wl"] = 4
+    if "extinct" in key or "imag" in key:
+        scores["k"] = 6
+    elif "k" in tokens:
+        scores["k"] = 5
+    if "n" in tokens or "refractive" in key:
+        scores["n"] = 6
+    elif "real" in key and "imag" not in key:
+        scores["n"] = 5
+    elif "index" in key and "extinct" not in key and "imag" not in key:
+        scores["n"] = 4
+    return scores
+
+
+def _silicon_column_indexes(headers: list[str]) -> tuple[int, int, int]:
+    """Pick wavelength, n, and k columns, or fall back to the first three."""
+    if len(headers) < 3:
+        raise MeasurementCsvError(
+            "The file needs wavelength, n, and k columns."
+        )
+    keys = [_header_key(header) for header in headers]
+    role_scores = [_silicon_role_scores(key) for key in keys]
+    chosen: dict[str, int] = {}
+    used: set[int] = set()
+    for role in ("wl", "n", "k"):
+        best_index = None
+        best_score = 0
+        for index, scores in enumerate(role_scores):
+            if index in used:
+                continue
+            score = scores[role]
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index is None:
+            return 0, 1, 2
+        chosen[role] = best_index
+        used.add(best_index)
+    return chosen["wl"], chosen["n"], chosen["k"]
+
+
+def parse_silicon_reference(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load wavelength, refractive index n, and extinction coefficient k."""
+    try:
+        rows = _load_table_rows(path)
+    except MeasurementCsvError:
+        raise
+    except OSError as exc:
+        raise MeasurementCsvError(f"Could not read file: {exc}") from exc
+
+    rows = [row for row in rows if any(str(cell).strip() for cell in row)]
+    if rows and str(rows[0][0]).strip().lower().startswith("sep="):
+        rows = rows[1:]
+    if not rows:
+        raise MeasurementCsvError("The file is empty.")
+
+    first = [str(cell).strip() for cell in rows[0]]
+    if _row_looks_numeric(first):
+        if len(first) < 3:
+            raise MeasurementCsvError(
+                "The file needs wavelength, n, and k columns."
+            )
+        wl_idx, n_idx, k_idx = 0, 1, 2
+        data_rows = rows
+    else:
+        headers = first
+        wl_idx, n_idx, k_idx = _silicon_column_indexes(headers)
+        data_rows = rows[1:]
+
+    if len({wl_idx, n_idx, k_idx}) < 3:
+        raise MeasurementCsvError(
+            "Could not find separate wavelength, n, and k columns."
+        )
+
+    wavelengths: list[float] = []
+    refractive_index: list[float] = []
+    extinction: list[float] = []
+    for row in data_rows:
+        cells = [str(cell).strip() for cell in row]
+        if max(wl_idx, n_idx, k_idx) >= len(cells):
+            continue
+        wavelength = _parse_numeric_cell(cells[wl_idx])
+        n_value = _parse_numeric_cell(cells[n_idx])
+        k_value = _parse_numeric_cell(cells[k_idx])
+        if wavelength is None or n_value is None or k_value is None:
+            continue
+        wavelengths.append(wavelength)
+        refractive_index.append(n_value)
+        extinction.append(k_value)
+
+    if len(wavelengths) < 2:
+        raise MeasurementCsvError(
+            "The file does not contain at least two numeric wavelength, n, and k rows."
+        )
+    return (
+        np.asarray(wavelengths, dtype=np.float64),
+        np.asarray(refractive_index, dtype=np.float64),
+        np.asarray(extinction, dtype=np.float64),
+    )
+
+
 def _wavelength_axes_match(imported: np.ndarray, reference: np.ndarray) -> bool:
     """True when both axes have the same length and agree to ~0.05 nm."""
     if imported.shape != reference.shape:
@@ -466,6 +620,83 @@ def _interpolate_reflectance_series(
     return _interpolate_series(wl, values, queries, method)
 
 
+def _prepare_si_axis(
+    wavelengths: np.ndarray, values: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Finite, strictly increasing wavelength/value pairs for silicon interpolation."""
+    wl = np.asarray(wavelengths, dtype=np.float64)
+    series = np.asarray(values, dtype=np.float64)
+    mask = np.isfinite(wl) & np.isfinite(series)
+    if int(mask.sum()) < 2:
+        raise ValueError("Silicon data does not have enough finite points to interpolate.")
+    order = np.argsort(wl[mask])
+    x = wl[mask][order]
+    y = series[mask][order]
+    unique = np.concatenate(([True], np.diff(x) > 0))
+    x = x[unique]
+    y = y[unique]
+    if x.size < 2:
+        raise ValueError("Silicon data does not have enough finite points to interpolate.")
+    return x, y
+
+
+def _extrapolate_linear(
+    x: np.ndarray, y: np.ndarray, queries: np.ndarray
+) -> np.ndarray:
+    """Linear interpolation that continues the end-segment slope past the data."""
+    out = np.interp(queries, x, y).astype(np.float64, copy=True)
+    left_slope = (y[1] - y[0]) / (x[1] - x[0])
+    right_slope = (y[-1] - y[-2]) / (x[-1] - x[-2])
+    below = queries < x[0]
+    above = queries > x[-1]
+    out[below] = y[0] + left_slope * (queries[below] - x[0])
+    out[above] = y[-1] + right_slope * (queries[above] - x[-1])
+    return out
+
+
+def _extrapolate_nearest(
+    x: np.ndarray, y: np.ndarray, queries: np.ndarray
+) -> np.ndarray:
+    """Nearest-neighbor interpolation, using the end samples outside the data."""
+    distances = np.abs(x.reshape(-1, 1) - queries.reshape(1, -1))
+    return y[np.argmin(distances, axis=0)].astype(np.float64, copy=False)
+
+
+def _interpolate_si_series(
+    wavelengths: np.ndarray,
+    values: np.ndarray,
+    new_wavelengths: np.ndarray,
+    method: str,
+) -> np.ndarray:
+    """Resample one silicon series, extrapolating outside the imported span."""
+    x, y = _prepare_si_axis(wavelengths, values)
+    queries = np.asarray(new_wavelengths, dtype=np.float64)
+    kind = {"Linear": "linear", "Cubic": "cubic", "Nearest": "nearest"}.get(method)
+    if kind is None:
+        raise ValueError(f"Unknown interpolation method: {method}")
+    if kind == "cubic" and x.size < 4:
+        raise ValueError("Cubic interpolation needs at least four silicon points.")
+    try:
+        from scipy.interpolate import interp1d
+    except ImportError:
+        interp1d = None  # type: ignore[assignment]
+    if interp1d is not None:
+        interpolator = interp1d(
+            x, y, kind=kind, bounds_error=False, fill_value="extrapolate"
+        )
+        return np.asarray(interpolator(queries), dtype=np.float64)
+    if kind == "nearest":
+        return _extrapolate_nearest(x, y, queries)
+    if kind == "cubic":
+        interior = _natural_cubic_interpolate(x, y, queries)
+        outside = ~np.isfinite(interior)
+        if np.any(outside):
+            interior = interior.copy()
+            interior[outside] = _extrapolate_linear(x, y, queries[outside])
+        return interior
+    return _extrapolate_linear(x, y, queries)
+
+
 # Denominators at or below this count difference are treated as zero.
 _REFLECTANCE_DENOM_FLOOR = 1e-9
 
@@ -640,15 +871,27 @@ class SpectrumTableModel(QAbstractTableModel):
             return
         for trace_name, values in updates.items():
             array = np.asarray(values, dtype=np.float64)
-            if array.shape != (self._n,):
+            axis = self.wavelengths()
+            if array.shape != axis.shape:
                 raise ValueError(
                     f"{trace_name} length {array.size} does not match "
-                    f"the table length {self._n}"
+                    f"the measurement length {axis.size}"
                 )
         self.beginResetModel()
         kept: list[tuple[str, Optional[np.ndarray], str]] = []
         for header, series, kind in self._columns:
-            if kind == "wavelength" or kind.startswith("source:"):
+            if (
+                kind == "wavelength"
+                or kind.startswith("source:")
+                or kind in {
+                    "si_wl",
+                    "si_n",
+                    "si_k",
+                    "si_interp_wl",
+                    "si_interp_n",
+                    "si_interp_k",
+                }
+            ):
                 kept.append((header, series, kind))
         self._columns = kept
         for trace_name, values in updates.items():
@@ -696,7 +939,7 @@ class SpectrumTableModel(QAbstractTableModel):
                 f"Reflectance length {array.size} does not match "
                 f"the table length {self._n}"
             )
-        header = "Reflectance"
+        header = "Relative Reflectance"
         idx = self._find_kind_index("reflectance")
         if idx is None:
             new_col = self.columnCount()
@@ -722,7 +965,7 @@ class SpectrumTableModel(QAbstractTableModel):
     def set_interpolated_reflectance(
         self, wavelengths: np.ndarray, values: np.ndarray
     ) -> None:
-        """Show the target grid beside Interpolated Reflectance.
+        """Show the reflectance grid beside Interpolated Relative Reflectance.
 
         Arrays may be shorter than the raw table; leftover rows stay blank.
         """
@@ -733,8 +976,8 @@ class SpectrumTableModel(QAbstractTableModel):
                 "Interpolated reflectance wavelengths and values must be the same non-empty length."
             )
         columns = (
-            ("Reflectance Wavelength (nm)", wl_vals, "reflectance_interp_wl"),
-            ("Interpolated Reflectance", reflectance_vals, "reflectance_interp"),
+            ("Relative Reflectance Wavelength (nm)", wl_vals, "reflectance_interp_wl"),
+            ("Interpolated Relative Reflectance", reflectance_vals, "reflectance_interp"),
         )
         for header, array, kind in columns:
             idx = self._find_kind_index(kind)
@@ -749,6 +992,88 @@ class SpectrumTableModel(QAbstractTableModel):
             bottom = self.index(self._n - 1, idx)
             self.dataChanged.emit(top, bottom)
             self.headerDataChanged.emit(Qt.Orientation.Horizontal, idx, idx)
+
+    def set_silicon_reference(
+        self,
+        wavelengths: np.ndarray,
+        refractive_index: np.ndarray,
+        extinction: np.ndarray,
+    ) -> None:
+        """Append or replace Si Wavelength, Si n, and Si k without touching measurements.
+
+        The table grows when the reference is longer than the current row count.
+        Measurement cells past their own data stay blank.
+        """
+        wl_vals = np.asarray(wavelengths, dtype=np.float64)
+        n_vals = np.asarray(refractive_index, dtype=np.float64)
+        k_vals = np.asarray(extinction, dtype=np.float64)
+        if (
+            wl_vals.ndim != 1
+            or wl_vals.shape != n_vals.shape
+            or wl_vals.shape != k_vals.shape
+            or wl_vals.size < 2
+        ):
+            raise ValueError(
+                "Silicon wavelength, n, and k must be the same length "
+                "and contain at least two points."
+            )
+        columns = (
+            ("Si Wavelength (nm)", wl_vals, "si_wl"),
+            ("Si n", n_vals, "si_n"),
+            ("Si k", k_vals, "si_k"),
+        )
+        self.beginResetModel()
+        self._n = max(self._n, int(wl_vals.size))
+        self._columns = [
+            column
+            for column in self._columns
+            if column[2]
+            not in {
+                "si_wl",
+                "si_n",
+                "si_k",
+                "si_reflectance",
+                "si_interp_wl",
+                "si_interp_n",
+                "si_interp_k",
+            }
+        ]
+        self._columns.extend(columns)
+        self.endResetModel()
+
+    def set_interpolated_silicon(
+        self,
+        wavelengths: np.ndarray,
+        refractive_index: np.ndarray,
+        extinction: np.ndarray,
+    ) -> None:
+        """Append or replace the interpolated silicon wavelength, n, and k columns."""
+        wl_vals = np.asarray(wavelengths, dtype=np.float64)
+        n_vals = np.asarray(refractive_index, dtype=np.float64)
+        k_vals = np.asarray(extinction, dtype=np.float64)
+        if (
+            wl_vals.ndim != 1
+            or wl_vals.shape != n_vals.shape
+            or wl_vals.shape != k_vals.shape
+            or wl_vals.size < 1
+        ):
+            raise ValueError(
+                "Interpolated silicon wavelength, n, and k must be the same non-empty length."
+            )
+        columns = (
+            ("Interpolated Si Wavelength (nm)", wl_vals, "si_interp_wl"),
+            ("Interpolated Si n", n_vals, "si_interp_n"),
+            ("Interpolated Si k", k_vals, "si_interp_k"),
+        )
+        self.beginResetModel()
+        self._n = max(self._n, int(wl_vals.size))
+        self._columns = [
+            column
+            for column in self._columns
+            if column[2] not in {"si_interp_wl", "si_interp_n", "si_interp_k"}
+        ]
+        self._columns.extend(columns)
+        self.endResetModel()
 
     def _find_kind_index(self, kind: str) -> Optional[int]:
         for i, (_header, _series, col_kind) in enumerate(self._columns):
@@ -874,6 +1199,12 @@ class PostProcessDialog(QDialog):
         self._on_imported = on_imported
         self._reflectance: Optional[np.ndarray] = None
         self.interpolated_reflectance: Optional[dict[str, np.ndarray]] = None
+        self.si_wavelength: Optional[np.ndarray] = None
+        self.si_n: Optional[np.ndarray] = None
+        self.si_k: Optional[np.ndarray] = None
+        self.si_interp_wavelength: Optional[np.ndarray] = None
+        self.si_interp_n: Optional[np.ndarray] = None
+        self.si_interp_k: Optional[np.ndarray] = None
         self._raw_wavelengths = np.asarray(wavelengths, dtype=np.float64)
         self._wl_min = float(self._raw_wavelengths.min())
         self._wl_max = float(self._raw_wavelengths.max())
@@ -885,6 +1216,13 @@ class PostProcessDialog(QDialog):
             QDialog {
                 background-color: #12141a;
                 color: #e8eaed;
+            }
+            QScrollArea {
+                background-color: transparent;
+                border: none;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: transparent;
             }
             QLabel {
                 color: #c5cad4;
@@ -1035,25 +1373,51 @@ class PostProcessDialog(QDialog):
             sample is not None,
         )
 
-    def _build_sidebar(self) -> QWidget:
-        sidebar = QWidget(self)
-        sidebar.setFixedWidth(268)
-        sidebar.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
-        )
-        layout = QVBoxLayout(sidebar)
+    def _build_sidebar(self) -> QScrollArea:
+        content = QWidget()
+        content.setMinimumWidth(300)
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         layout.addWidget(self._build_average_group())
         layout.addWidget(self._build_interpolation_group())
+        layout.addWidget(self._build_reflectance_group())
+        layout.addWidget(self._build_silicon_group())
         layout.addStretch(1)
-        return sidebar
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        scroll.setFixedWidth(320)
+        scroll.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+        )
+        return scroll
 
     def _build_table_pane(self) -> QVBoxLayout:
         pane = QVBoxLayout()
         pane.setContentsMargins(0, 0, 0, 0)
         pane.setSpacing(8)
         pane.addWidget(self._table, stretch=1)
+
+        self._export_table_btn = QPushButton("Export")
+        self._export_table_btn.setObjectName("accentBtn")
+        self._export_table_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._export_table_btn.setToolTip(
+            "Export all table columns, including relative reflectance, "
+            "interpolated relative reflectance, and imported silicon values"
+        )
+        self._export_table_btn.clicked.connect(self._export_processed_table)
+
+        self._import_csv_btn = QPushButton("Import")
+        self._import_csv_btn.setObjectName("accentBtn")
+        self._import_csv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_csv_btn.setToolTip(
+            "Load Baseline, Standard, and Sample together from a multi-column CSV"
+        )
+        self._import_csv_btn.clicked.connect(self._import_measurement_csv)
 
         bar = QHBoxLayout()
         bar.setSpacing(8)
@@ -1224,45 +1588,112 @@ class PostProcessDialog(QDialog):
         )
         self._interpolate_all_btn.clicked.connect(self._interpolate_all)
         layout.addWidget(self._interpolate_all_btn)
+        return group
 
-        self._reflectance_btn = QPushButton("Reflectance")
+    def _build_reflectance_group(self) -> QGroupBox:
+        """Relative-reflectance controls, with a grid independent of the traces."""
+        group = QGroupBox("Reflectance")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
+        self._ref_start_wl_edit = self._make_grid_edit(
+            350.0, 0.0, 5000.0, "Reflectance start wavelength (nm)"
+        )
+        self._ref_end_wl_edit = self._make_grid_edit(
+            1000.0, 0.0, 5000.0, "Reflectance end wavelength (nm)"
+        )
+        self._ref_step_wl_edit = self._make_grid_edit(
+            1.0, 0.1, 50.0, "Reflectance step size (nm)"
+        )
+        self._ref_method_combo = QComboBox()
+        self._ref_method_combo.addItems(["Linear", "Cubic Spline"])
+        self._ref_method_combo.setCurrentText("Linear")
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        form.addRow("Start", self._ref_start_wl_edit)
+        form.addRow("End", self._ref_end_wl_edit)
+        form.addRow("Step size", self._ref_step_wl_edit)
+        form.addRow("Method", self._ref_method_combo)
+        layout.addLayout(form)
+
+        self._reflectance_btn = QPushButton("Relative Reflectance")
         self._reflectance_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._reflectance_btn.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         self._reflectance_btn.setToolTip(
-            "Reflectance = (Sample_avg − Baseline_avg) / "
+            "Relative Reflectance = (Sample_avg − Baseline_avg) / "
             "(Standard_avg − Baseline_avg) at each wavelength"
         )
         self._reflectance_btn.clicked.connect(self._calculate_reflectance)
         layout.addWidget(self._reflectance_btn)
 
-        self._interp_reflectance_btn = QPushButton("Interpolate Reflectance")
+        self._interp_reflectance_btn = QPushButton("Interpolate Relative Reflectance")
         self._interp_reflectance_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._interp_reflectance_btn.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         self._interp_reflectance_btn.setToolTip(
-            "Resample reflectance onto the start, end, and step wavelength grid"
+            "Resample relative reflectance onto the Reflectance group wavelength grid"
         )
         self._interp_reflectance_btn.clicked.connect(self._interpolate_reflectance)
         layout.addWidget(self._interp_reflectance_btn)
+        return group
 
-        self._export_table_btn = QPushButton("Export")
-        self._export_table_btn.setObjectName("accentBtn")
-        self._export_table_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._export_table_btn.setToolTip(
-            "Export all table columns, including reflectance and interpolated reflectance"
+    def _build_silicon_group(self) -> QGroupBox:
+        """Silicon n and k import, with a grid used only for those curves."""
+        group = QGroupBox("Silicon Calibration")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+        self._import_si_btn = QPushButton("Import Si Values")
+        self._import_si_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_si_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
-        self._export_table_btn.clicked.connect(self._export_processed_table)
+        self._import_si_btn.setToolTip(
+            "Load silicon wavelength, refractive index n, and extinction coefficient k"
+        )
+        self._import_si_btn.clicked.connect(self._import_si_values)
+        layout.addWidget(self._import_si_btn)
 
-        self._import_csv_btn = QPushButton("Import")
-        self._import_csv_btn.setObjectName("accentBtn")
-        self._import_csv_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._import_csv_btn.setToolTip(
-            "Load Baseline, Standard, and Sample together from a multi-column CSV"
+        self._si_start_wl_edit = self._make_grid_edit(
+            350.0, 0.0, 5000.0, "Silicon start wavelength (nm)"
         )
-        self._import_csv_btn.clicked.connect(self._import_measurement_csv)
+        self._si_end_wl_edit = self._make_grid_edit(
+            1000.0, 0.0, 5000.0, "Silicon end wavelength (nm)"
+        )
+        self._si_step_wl_edit = self._make_grid_edit(
+            1.0, 0.1, 50.0, "Silicon step size (nm)"
+        )
+        self._si_method_combo = QComboBox()
+        self._si_method_combo.addItems(["Linear", "Cubic", "Nearest"])
+        self._si_method_combo.setCurrentText("Linear")
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        form.addRow("Start", self._si_start_wl_edit)
+        form.addRow("End", self._si_end_wl_edit)
+        form.addRow("Step size", self._si_step_wl_edit)
+        form.addRow("Method", self._si_method_combo)
+        layout.addLayout(form)
+
+        self._interp_si_btn = QPushButton("Interpolate Si (n and k)")
+        self._interp_si_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._interp_si_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._interp_si_btn.setToolTip(
+            "Resample imported silicon n and k onto this wavelength grid"
+        )
+        self._interp_si_btn.clicked.connect(self._interpolate_silicon)
+        layout.addWidget(self._interp_si_btn)
         return group
 
     def _interpolate_selected(self, trace_name: str) -> None:
@@ -1459,6 +1890,7 @@ class PostProcessDialog(QDialog):
         return "Linear" if method == "Linear" else "Cubic Spline"
 
     def _current_interp_grid(self) -> np.ndarray:
+        """Wavelength grid from the Interpolation group (Baseline, Standard, Sample)."""
         return _build_uniform_wavelengths(
             self._field_float(self._start_wl_edit),
             self._field_float(self._end_wl_edit),
@@ -1466,6 +1898,40 @@ class PostProcessDialog(QDialog):
             self._wl_min,
             self._wl_max,
         )
+
+    def _current_reflectance_method(self) -> str:
+        method = self._ref_method_combo.currentText()
+        return "Linear" if method == "Linear" else "Cubic Spline"
+
+    def _current_reflectance_grid(self) -> np.ndarray:
+        """Wavelength grid from the Reflectance group only."""
+        return _build_uniform_wavelengths(
+            self._field_float(self._ref_start_wl_edit),
+            self._field_float(self._ref_end_wl_edit),
+            self._field_float(self._ref_step_wl_edit),
+            self._wl_min,
+            self._wl_max,
+        )
+
+    def _current_si_method(self) -> str:
+        method = self._si_method_combo.currentText()
+        if method in {"Linear", "Cubic", "Nearest"}:
+            return method
+        return "Linear"
+
+    def _current_si_grid(self) -> np.ndarray:
+        """Target wavelengths from the Silicon Calibration fields only."""
+        start = self._field_float(self._si_start_wl_edit)
+        end = self._field_float(self._si_end_wl_edit)
+        step = self._field_float(self._si_step_wl_edit)
+        if step <= 0:
+            raise ValueError("Step size must be positive")
+        if end < start:
+            raise ValueError("End wavelength must be >= start wavelength")
+        grid = np.arange(start, end + step / 2.0, step, dtype=np.float64)
+        if grid.size < 1:
+            raise ValueError("Target wavelength grid is empty")
+        return grid
 
     def _interpolate_all(self) -> None:
         """Interpolate every captured trace onto the current wavelength grid."""
@@ -1568,7 +2034,7 @@ class PostProcessDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "Measurements Required",
-                "Reflectance needs averaged Baseline, Standard, and Sample "
+                "Relative Reflectance needs averaged Baseline, Standard, and Sample "
                 "data at each wavelength.\n\n"
                 f"Missing or incomplete: {', '.join(missing)}.\n"
                 "Capture or import all three measurements, average them, "
@@ -1584,7 +2050,7 @@ class PostProcessDialog(QDialog):
         try:
             self._model.set_reflectance(reflectance)
         except ValueError as exc:
-            QMessageBox.warning(self, "Reflectance Failed", str(exc))
+            QMessageBox.warning(self, "Relative Reflectance Failed", str(exc))
             return False
 
         self._model.clear_interpolated_reflectance()
@@ -1601,24 +2067,24 @@ class PostProcessDialog(QDialog):
         self._summary.setText(
             f"Optical mode: {self._mode_display}  ·  "
             f"{self._model.rowCount()} raw rows  ·  "
-            f"Reflectance computed ({finite} finite points)"
+            f"Relative Reflectance computed ({finite} finite points)"
         )
         return True
 
     def _interpolate_reflectance(self) -> None:
-        """Resample reflectance onto the configured target wavelength grid."""
+        """Resample relative reflectance using only the Reflectance group grid."""
         if self._reflectance is None or not np.any(np.isfinite(self._reflectance)):
             if not self._calculate_reflectance():
                 return
         assert self._reflectance is not None
 
         try:
-            grid = self._current_interp_grid()
+            grid = self._current_reflectance_grid()
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid Grid", str(exc))
             return
 
-        method_key = self._current_interp_method()
+        method_key = self._current_reflectance_method()
         try:
             resampled = _interpolate_reflectance_series(
                 self._model.wavelengths(),
@@ -1652,15 +2118,16 @@ class PostProcessDialog(QDialog):
         self._summary.setText(
             f"Optical mode: {self._mode_display}  ·  "
             f"{self._model.rowCount()} raw rows  ·  "
-            f"{grid.size} interpolated reflectance points "
+            f"{grid.size} interpolated relative reflectance points "
             f"({grid[0]:.3f}–{grid[-1]:.3f} nm, "
-            f"step {self._field_float(self._step_wl_edit):.3f} nm, {method_key})"
+            f"step {self._field_float(self._ref_step_wl_edit):.3f} nm, {method_key})"
         )
 
     def _export_processed_table(self) -> None:
         headers, rows = self._model.export_rows()
-        # Every visible column is written, including Reflectance and
-        # Interpolated Reflectance when those calculations have been run.
+        # Every visible column is written, including Relative Reflectance,
+        # Interpolated Relative Reflectance, imported silicon values, and
+        # interpolated silicon n and k.
         col_count = len(headers)
         normalized_rows: list[list[str]] = []
         for row in rows:
@@ -1777,6 +2244,116 @@ class PostProcessDialog(QDialog):
             f"Loaded {imported_wavelengths.size} points into: {summary}.",
         )
 
+    def _import_si_values(self) -> None:
+        """Load silicon wavelength, n, and k into the table."""
+        path_str, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Import Si Values",
+            str(Path.home()),
+            "Excel/CSV Files (*.xlsx *.xls *.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            wavelengths, refractive_index, extinction = parse_silicon_reference(
+                Path(path_str)
+            )
+        except MeasurementCsvError as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+            return
+        try:
+            self._model.set_silicon_reference(
+                wavelengths, refractive_index, extinction
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+            return
+
+        self.si_wavelength = np.asarray(wavelengths, dtype=np.float64).copy()
+        self.si_n = np.asarray(refractive_index, dtype=np.float64).copy()
+        self.si_k = np.asarray(extinction, dtype=np.float64).copy()
+        self.si_interp_wavelength = None
+        self.si_interp_n = None
+        self.si_interp_k = None
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "si_wavelength"):
+            parent.si_wavelength = self.si_wavelength.copy()
+            parent.si_n = self.si_n.copy()
+            parent.si_k = self.si_k.copy()
+            if hasattr(parent, "si_interp_wavelength"):
+                parent.si_interp_wavelength = None
+                parent.si_interp_n = None
+                parent.si_interp_k = None
+        self._table.resizeColumnsToContents()
+        self._summary.setText(
+            f"Optical mode: {self._mode_display}  ·  "
+            f"{self._model.rowCount()} raw rows  ·  "
+            f"{wavelengths.size} silicon reference points"
+        )
+        QMessageBox.information(
+            self,
+            "Import Complete",
+            f"Loaded {wavelengths.size} silicon reference points into "
+            "Si Wavelength (nm), Si n, and Si k.",
+        )
+
+    def _interpolate_silicon(self) -> None:
+        """Resample imported silicon n and k onto the Silicon Calibration grid."""
+        if (
+            self.si_wavelength is None
+            or self.si_n is None
+            or self.si_k is None
+            or self.si_wavelength.size < 2
+        ):
+            QMessageBox.warning(
+                self,
+                "Silicon Data Required",
+                "Import Si values before interpolating n and k.",
+            )
+            return
+        try:
+            grid = self._current_si_grid()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Grid", str(exc))
+            return
+        method = self._current_si_method()
+        try:
+            interp_n = _interpolate_si_series(
+                self.si_wavelength, self.si_n, grid, method
+            )
+            interp_k = _interpolate_si_series(
+                self.si_wavelength, self.si_k, grid, method
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Interpolation Failed", str(exc))
+            return
+        except Exception as exc:
+            logger.exception("Silicon interpolation failed")
+            QMessageBox.critical(self, "Interpolation Failed", str(exc))
+            return
+        try:
+            self._model.set_interpolated_silicon(grid, interp_n, interp_k)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Interpolation Failed", str(exc))
+            return
+
+        self.si_interp_wavelength = np.asarray(grid, dtype=np.float64).copy()
+        self.si_interp_n = np.asarray(interp_n, dtype=np.float64).copy()
+        self.si_interp_k = np.asarray(interp_k, dtype=np.float64).copy()
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "si_interp_wavelength"):
+            parent.si_interp_wavelength = self.si_interp_wavelength.copy()
+            parent.si_interp_n = self.si_interp_n.copy()
+            parent.si_interp_k = self.si_interp_k.copy()
+        self._table.resizeColumnsToContents()
+        self._summary.setText(
+            f"Optical mode: {self._mode_display}  ·  "
+            f"{self._model.rowCount()} raw rows  ·  "
+            f"{grid.size} interpolated silicon points "
+            f"({grid[0]:.3f}–{grid[-1]:.3f} nm, "
+            f"step {self._field_float(self._si_step_wl_edit):.3f} nm, {method})"
+        )
+
 
 class SpectrometerApp(QMainWindow):
     """Main window: live spectrum, multi-geometry capture slots, and export."""
@@ -1804,6 +2381,12 @@ class SpectrometerApp(QMainWindow):
         self.interpolated_reflectance: dict[str, Optional[dict[str, np.ndarray]]] = {
             key: None for key in OPTICAL_MODE_KEYS
         }
+        self.si_wavelength: Optional[np.ndarray] = None
+        self.si_n: Optional[np.ndarray] = None
+        self.si_k: Optional[np.ndarray] = None
+        self.si_interp_wavelength: Optional[np.ndarray] = None
+        self.si_interp_n: Optional[np.ndarray] = None
+        self.si_interp_k: Optional[np.ndarray] = None
         # Wavelength axis shared across modes (detector axis is fixed).
         self._wavelengths: Optional[np.ndarray] = None
 
