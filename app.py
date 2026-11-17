@@ -2355,6 +2355,866 @@ class PostProcessDialog(QDialog):
         )
 
 
+# ===========================================================================
+# ADDED FEATURE: progress pop-up for post-processing calculations
+# ---------------------------------------------------------------------------
+# Everything in this block is new. PostProcessDialog above is not modified.
+#
+# There are two ways to run work inside the pop-up:
+#
+# 1. Existing buttons  -> PostProcessDialogWithProgress._run_with_progress
+#    The original handler methods are reused unchanged. Because they update
+#    widgets and show message boxes, they must run on the GUI thread and they
+#    cannot report how far along they are. So the bar fills on a short timer,
+#    then shows "Working…" while the handler actually runs, and "Completed"
+#    reports the real calculation time. (Measured worst cases at the most
+#    extreme settings the UI allows: under 0.5 s with SciPy installed.)
+#
+# 2. New long calculations  -> run_with_real_progress(...) /
+#                              PostProcessDialogWithProgress.run_long_task(...)
+#    The work runs on a background thread and reports real progress, so the
+#    bar shows the true percentage, elapsed and remaining time, Cancel works,
+#    and the window (including the live plot) never freezes. Use this for
+#    anything that can take more than about a second, e.g. the planned
+#    d1/n1 and n1(λ)/k1(λ) solvers.
+#
+# The post-processing sidebar is split into two tabs ("Original" and
+# "Nd and Nk"). The Nd and Nk tab holds Silicon Calibration and the new
+# Si Reflectance step (bare-silicon reflectance at 0° and 60°, s-polarized).
+# ===========================================================================
+
+import threading  # noqa: E402  (imports used only by this block)
+import time  # noqa: E402
+from functools import partial  # noqa: E402
+
+from PyQt6.QtCore import QElapsedTimer, QObject, pyqtSignal, pyqtSlot  # noqa: E402
+from PyQt6.QtWidgets import QProgressBar, QTabWidget  # noqa: E402
+
+# Timed fill used for the existing (fast, GUI-thread) buttons.
+_PROGRESS_FILL_MS: int = 800
+# How long "Completed" / "Cancelled" stays visible before the pop-up closes.
+_PROGRESS_DONE_HOLD_MS: int = 600
+_PROGRESS_TICK_MS: int = 15
+# Background tasks: minimum time between progress updates sent to the GUI,
+# so a task that reports every loop iteration cannot flood the event queue.
+_PROGRESS_REPORT_MIN_INTERVAL_S: float = 0.03
+
+
+class TaskCancelled(Exception):
+    """Raised inside a background task's ``report()`` after Cancel is pressed."""
+
+
+class _BackgroundTask(QObject):
+    """Runs ``work(report)`` on a worker thread and relays progress to the GUI."""
+
+    progress = pyqtSignal(float)
+    succeeded = pyqtSignal(object)
+    failed = pyqtSignal(object)
+    cancelled = pyqtSignal()
+
+    def __init__(self, work: Callable[[Callable[[float], None]], object]) -> None:
+        super().__init__()
+        self._work = work
+        self._cancel_requested = threading.Event()
+        self._last_emit = 0.0
+        self._last_value = -1.0
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def report(self, fraction: float) -> None:
+        """Called by the work function (worker thread) with 0.0 … 1.0."""
+        if self._cancel_requested.is_set():
+            raise TaskCancelled()
+        value = min(1.0, max(0.0, float(fraction)))
+        now = time.monotonic()
+        if value >= 1.0 or (
+            value != self._last_value
+            and now - self._last_emit >= _PROGRESS_REPORT_MIN_INTERVAL_S
+        ):
+            self._last_emit = now
+            self._last_value = value
+            self.progress.emit(value)
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            result = self._work(self.report)
+        except TaskCancelled:
+            self.cancelled.emit()
+        except Exception as exc:  # reported to the user by the pop-up
+            logger.exception("Background calculation failed")
+            self.failed.emit(exc)
+        else:
+            self.succeeded.emit(result)
+
+
+class ProgressPopup(QDialog):
+    """Small modal pop-up with a 0 → 100 % bar.
+
+    ``run_handler()`` is used for the existing GUI-thread buttons (timed fill,
+    then the handler runs). ``run_task()`` runs a background calculation with
+    real progress, elapsed / remaining time and a Cancel button.
+    After closing, ``outcome`` is one of "completed", "unchanged",
+    "cancelled" or "failed".
+    """
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(
+            parent, Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+        self._title = title
+        self._mode: Optional[str] = None
+        self._finished = False
+        self._action: Optional[Callable[[], object]] = None
+        self._did_change: Optional[Callable[[], bool]] = None
+        self._on_done: Optional[Callable[[object], object]] = None
+        self._task: Optional[_BackgroundTask] = None
+        self._thread: Optional[QThread] = None
+        self._fraction = 0.0
+        self._cancel_requested = False
+        self.completed = False
+        self.outcome: Optional[str] = None
+        self.result: object = None
+        self.error: Optional[BaseException] = None
+
+        self.setObjectName("progressPopup")
+        self.setModal(True)
+        self.setFixedWidth(380)
+        self.setStyleSheet(
+            """
+            QDialog#progressPopup {
+                background-color: #1a1d23;
+            }
+            QFrame#progressCard {
+                background-color: #1a1d23;
+                border: 1px solid #00bcd4;
+            }
+            QLabel#progressTitle {
+                color: #e8eaed;
+                font-weight: 600;
+                background: transparent;
+                border: none;
+            }
+            QLabel#progressStatus {
+                color: #9aa3b2;
+                background: transparent;
+                border: none;
+            }
+            QProgressBar {
+                background-color: #12141a;
+                border: 1px solid #3d4450;
+                border-radius: 6px;
+                color: #e8eaed;
+                text-align: center;
+                min-height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #00bcd4;
+                border-radius: 5px;
+            }
+            QProgressBar[done="true"]::chunk {
+                background-color: #4caf50;
+            }
+            QPushButton#progressCancel {
+                background-color: #2a2f3a;
+                border: 1px solid #3d4450;
+                border-radius: 6px;
+                padding: 2px 14px;
+                min-height: 22px;
+                color: #e8eaed;
+            }
+            QPushButton#progressCancel:hover:!disabled {
+                background-color: #353b48;
+            }
+            QPushButton#progressCancel:disabled {
+                color: #6d7480;
+            }
+            """
+        )
+
+        card = QFrame(self)
+        card.setObjectName("progressCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(8)
+
+        self._title_label = QLabel(title, card)
+        self._title_label.setObjectName("progressTitle")
+        self._bar = QProgressBar(card)
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setProperty("done", "false")
+        self._status_label = QLabel("Processing…", card)
+        self._status_label.setObjectName("progressStatus")
+
+        self._cancel_btn = QPushButton("Cancel", card)
+        self._cancel_btn.setObjectName("progressCancel")
+        self._cancel_btn.setAutoDefault(False)
+        self._cancel_btn.setDefault(False)
+        self._cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel_btn.clicked.connect(self._request_cancel)
+        self._cancel_btn.hide()
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        status_row.addWidget(self._status_label, stretch=1)
+        status_row.addWidget(self._cancel_btn)
+
+        card_layout.addWidget(self._title_label)
+        card_layout.addWidget(self._bar)
+        card_layout.addLayout(status_row)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(card)
+
+        self._clock = QElapsedTimer()
+        self._fill_timer = QTimer(self)
+        self._fill_timer.setInterval(_PROGRESS_TICK_MS)
+        self._fill_timer.timeout.connect(self._fill_tick)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(200)
+        self._status_timer.timeout.connect(self._refresh_task_status)
+        self._close_timer = QTimer(self)
+        self._close_timer.setSingleShot(True)
+        self._close_timer.timeout.connect(self.accept)
+
+    # ------------------------------------------------------------------
+    # Mode 1: existing GUI-thread handlers
+    # ------------------------------------------------------------------
+
+    def run_handler(
+        self, action: Callable[[], object], did_change: Callable[[], bool]
+    ) -> Optional[str]:
+        """Timed fill, then run ``action`` on the GUI thread. Blocks until closed."""
+        self._mode = "handler"
+        self._action = action
+        self._did_change = did_change
+        self._clock.start()
+        self._fill_timer.start()
+        self.exec()
+        return self.outcome
+
+    def _fill_tick(self) -> None:
+        percent = min(100, int(self._clock.elapsed() * 100 / _PROGRESS_FILL_MS))
+        self._bar.setValue(percent)
+        if percent >= 100:
+            self._fill_timer.stop()
+            self._run_handler_now()
+
+    def _run_handler_now(self) -> None:
+        assert self._action is not None and self._did_change is not None
+        # Paint "Working…" immediately so it stays visible however long the
+        # handler takes (the handler blocks the GUI thread while it runs).
+        self._status_label.setText("Working…")
+        self.repaint()
+        started = time.perf_counter()
+        try:
+            self._action()
+        except BaseException:
+            # Close the pop-up, then let the error propagate exactly as it
+            # would have from the original button.
+            self._finished = True
+            self.accept()
+            raise
+        seconds = time.perf_counter() - started
+        self._finished = True
+
+        if not self._did_change():
+            # The handler showed its own warning or did nothing.
+            self.outcome = "unchanged"
+            self.accept()
+            return
+        self._show_completed(f"Completed ✓  (calculation took {seconds:.2f} s)")
+
+    # ------------------------------------------------------------------
+    # Mode 2: background calculation with real progress
+    # ------------------------------------------------------------------
+
+    def run_task(
+        self,
+        work: Callable[[Callable[[float], None]], object],
+        on_done: Optional[Callable[[object], object]] = None,
+    ) -> Optional[str]:
+        """Run ``work(report)`` on a background thread. Blocks until closed."""
+        self._mode = "task"
+        self._on_done = on_done
+        self._cancel_btn.show()
+        self._status_label.setText("Starting…")
+
+        self._task = _BackgroundTask(work)
+        self._thread = QThread(self)
+        self._task.moveToThread(self._thread)
+        self._thread.started.connect(self._task.run)
+        self._thread.finished.connect(self._task.deleteLater)
+        self._task.progress.connect(self._on_task_progress)
+        self._task.succeeded.connect(self._on_task_succeeded)
+        self._task.failed.connect(self._on_task_failed)
+        self._task.cancelled.connect(self._on_task_cancelled)
+
+        self._clock.start()
+        self._status_timer.start()
+        self._thread.start()
+        self.exec()
+        self._status_timer.stop()
+        self._thread.quit()
+        self._thread.wait()
+        self._task = None
+        return self.outcome
+
+    def _on_task_progress(self, fraction: float) -> None:
+        if self._finished:
+            return
+        self._fraction = fraction
+        self._bar.setValue(int(fraction * 100))
+        self._refresh_task_status()
+
+    def _refresh_task_status(self) -> None:
+        if self._finished or self._mode != "task":
+            return
+        if self._cancel_requested:
+            self._status_label.setText("Cancelling…")
+            return
+        elapsed = self._clock.elapsed() / 1000.0
+        text = f"{elapsed:.1f} s elapsed"
+        if 0.02 <= self._fraction < 1.0:
+            remaining = elapsed * (1.0 - self._fraction) / self._fraction
+            if remaining < 1.0:
+                text += "  ·  under 1 s left"
+            else:
+                text += f"  ·  about {remaining:.0f} s left"
+        self._status_label.setText(text)
+
+    def _on_task_succeeded(self, result: object) -> None:
+        self._finished = True
+        self._cancel_btn.hide()
+        seconds = self._clock.elapsed() / 1000.0
+        self.result = result
+        if self._on_done is not None:
+            try:
+                self._on_done(result)
+            except Exception as exc:
+                logger.exception("Displaying calculation results failed")
+                self.outcome = "failed"
+                self.error = exc
+                self.accept()
+                return
+        self._show_completed(f"Completed ✓  ({seconds:.2f} s)")
+
+    def _on_task_failed(self, exc: object) -> None:
+        self._finished = True
+        self.outcome = "failed"
+        self.error = exc if isinstance(exc, BaseException) else RuntimeError(str(exc))
+        self.accept()
+
+    def _on_task_cancelled(self) -> None:
+        self._finished = True
+        self.outcome = "cancelled"
+        self._cancel_btn.hide()
+        self._status_label.setText("Cancelled")
+        self._close_timer.start(_PROGRESS_DONE_HOLD_MS)
+
+    def _request_cancel(self) -> None:
+        if self._mode != "task" or self._finished or self._task is None:
+            return
+        self._cancel_requested = True
+        self._cancel_btn.setEnabled(False)
+        self._task.request_cancel()
+        self._refresh_task_status()
+
+    # ------------------------------------------------------------------
+    # Shared
+    # ------------------------------------------------------------------
+
+    def _show_completed(self, text: str) -> None:
+        self.completed = True
+        self.outcome = "completed"
+        self._bar.setValue(100)
+        self._status_label.setText(text)
+        self._bar.setProperty("done", "true")
+        self._bar.style().unpolish(self._bar)
+        self._bar.style().polish(self._bar)
+        self._close_timer.start(_PROGRESS_DONE_HOLD_MS)
+
+    def reject(self) -> None:  # Esc / Alt+F4
+        if self._finished:
+            super().reject()
+        elif self._mode == "task":
+            self._request_cancel()  # Esc acts like Cancel for long tasks
+        # Existing handlers: ignore until the handler has run.
+
+
+def run_with_real_progress(
+    parent: QWidget,
+    title: str,
+    work: Callable[[Callable[[float], None]], object],
+    on_done: Optional[Callable[[object], object]] = None,
+) -> Optional[str]:
+    """Run a slow calculation in a progress pop-up with real progress.
+
+    ``work(report)`` runs on a background thread. It must only do
+    calculations (NumPy, SciPy, plain Python) and must NOT touch any widget,
+    message box or table model. Call ``report(fraction)`` regularly with a
+    value from 0.0 to 1.0; that drives the bar and lets Cancel stop the work.
+    Whatever ``work`` returns is passed to ``on_done(result)``, which runs on
+    the GUI thread afterwards: update the table / labels there.
+
+    Returns "completed", "cancelled" or "failed". A failure has already been
+    shown to the user in an error box when this returns.
+
+    Example (e.g. a future d1 / n1 solver)::
+
+        def work(report):
+            best = None
+            for i, d1 in enumerate(d1_values):
+                ...                      # heavy NumPy maths only
+                report((i + 1) / len(d1_values))
+            return best
+
+        def show(result):
+            ...                          # update the table here
+
+        run_with_real_progress(self, "Solving d1 and n1", work, show)
+    """
+    popup = ProgressPopup(title, parent=parent)
+    try:
+        outcome = popup.run_task(work, on_done)
+        if outcome == "failed":
+            QMessageBox.critical(parent, f"{title} failed", str(popup.error))
+        return outcome
+    finally:
+        popup.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# Silicon reflectance (used by the "Nd and Nk" tab)
+# ---------------------------------------------------------------------------
+
+# Angles of incidence in degrees, matching the R₀ and R₆₀ optical modes.
+_SI_R_ANGLES_DEG: tuple[float, float] = (0.0, 60.0)
+# Table column kinds used for the calculated Si reflectance.
+_SI_R_KINDS: frozenset[str] = frozenset({"si_r_wl", "si_r0", "si_r60"})
+
+
+def bare_substrate_reflectance_s(
+    n2: np.ndarray, k2: np.ndarray, angle_deg: float, n0: float = 1.0
+) -> np.ndarray:
+    """Reflectance |r|² of an uncoated substrate in air, s-polarized.
+
+    This is the formula of Optical_Nd_V7S.py / Optical_NK_V7S.py with no film
+    (d1 = 0): the input admittance Y then equals the substrate admittance η2,
+    so r = (η0 − η2) / (η0 + η2) with η = N·cos θ (s-wave) and N = n − ik.
+    At 0° the s and p polarizations are identical. Works element-wise on
+    arrays of n2 and k2; NaN inputs give NaN.
+    """
+    with np.errstate(all="ignore"):
+        n_sub = np.asarray(n2, dtype=np.float64) - 1j * np.asarray(k2, dtype=np.float64)
+        n_amb = complex(n0, 0.0)
+        theta0 = math.radians(angle_deg)
+        theta2 = np.arcsin(n_amb / n_sub * math.sin(theta0))  # Snell's law
+        eta0 = n_amb * math.cos(theta0)
+        eta2 = n_sub * np.cos(theta2)
+        r = (eta0 - eta2) / (eta0 + eta2)
+        return (r * np.conj(r)).real
+
+
+def _replace_model_columns(
+    model: SpectrumTableModel,
+    kinds: frozenset[str],
+    new_columns: list[tuple[str, np.ndarray, str]],
+) -> None:
+    """Remove all columns of ``kinds`` from the table and append ``new_columns``.
+
+    Same approach as SpectrumTableModel's own Si methods (full model reset;
+    the row count grows if a new column is longer than the table).
+    """
+    model.beginResetModel()
+    for _header, series, _kind in new_columns:
+        model._n = max(model._n, int(np.asarray(series).size))
+    model._columns = [column for column in model._columns if column[2] not in kinds]
+    model._columns.extend(new_columns)
+    model.endResetModel()
+
+
+class PostProcessDialogWithProgress(PostProcessDialog):
+    """PostProcessDialog with progress pop-ups, sidebar tabs and new Nd/Nk tools.
+
+    The original handler methods are called unchanged. Only the signal
+    connections of these buttons/menu items are swapped for wrappers:
+    Average trace (Baseline/Standard/Sample), Average All,
+    Interpolate (Baseline/Standard/Sample), Interpolate all,
+    Relative Reflectance, Interpolate Relative Reflectance,
+    Interpolate Si (n and k), and the new Calculate Si Reflectance.
+    Import, Export, Import Si Values and Back keep their original wiring.
+
+    New long-running features should call ``self.run_long_task(...)``.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Calculated Si reflectance: {"wavelength", "R0", "R60", "source"}.
+        self.si_reflectance: Optional[dict[str, object]] = None
+        # The Si wavelength / n / k arrays it was calculated from.
+        self._si_reflectance_inputs: Optional[tuple[np.ndarray, ...]] = None
+        self._attach_progress_popups()
+
+    # -- Sidebar tabs (added) -------------------------------------------
+    # Tab titles: rename here later if needed.
+    _ORIGINAL_TAB_TITLE = "Original"
+    _ND_NK_TAB_TITLE = "Nd and Nk"
+
+    def _build_sidebar(self) -> QWidget:
+        """Two-tab sidebar instead of one scrolling column.
+
+        Overrides PostProcessDialog._build_sidebar (which stays unchanged) and
+        reuses the original group builders, so every control keeps its
+        original behaviour. The table on the right stays visible on both tabs.
+          "Original"  : Average, Interpolation, Reflectance
+          "Nd and Nk" : Silicon Calibration, Si Reflectance
+                        (future n / k / d tools go here)
+        """
+        self._sidebar_tabs = QTabWidget()
+        self._sidebar_tabs.setObjectName("sidebarTabs")
+        self._sidebar_tabs.setStyleSheet(
+            """
+            QTabWidget#sidebarTabs::pane {
+                border: 1px solid #3d4450;
+                border-radius: 6px;
+                top: -1px;
+            }
+            QTabWidget#sidebarTabs > QTabBar::tab {
+                background-color: #1a1e26;
+                color: #8b93a3;
+                border: 1px solid #3a4150;
+                border-bottom: none;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 6px 16px;
+                margin-right: 2px;
+                font-weight: 600;
+            }
+            QTabWidget#sidebarTabs > QTabBar::tab:selected {
+                background-color: #123e4f;
+                color: #e8fbff;
+                border: 1px solid #00bcd4;
+                border-bottom: none;
+            }
+            QTabWidget#sidebarTabs > QTabBar::tab:hover:!selected {
+                background-color: #353b48;
+                color: #e8eaed;
+            }
+            """
+        )
+        self._sidebar_tabs.addTab(
+            self._make_sidebar_page(
+                self._build_average_group(),
+                self._build_interpolation_group(),
+                self._build_reflectance_group(),
+            ),
+            self._ORIGINAL_TAB_TITLE,
+        )
+        self._sidebar_tabs.addTab(
+            self._make_sidebar_page(
+                self._build_silicon_group(),
+                self._build_si_reflectance_group(),
+            ),
+            self._ND_NK_TAB_TITLE,
+        )
+        self._sidebar_tabs.setFixedWidth(336)
+        self._sidebar_tabs.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+        )
+        return self._sidebar_tabs
+
+    @staticmethod
+    def _make_sidebar_page(*groups: QWidget) -> QScrollArea:
+        """One scrollable tab page, laid out like the original sidebar."""
+        content = QWidget()
+        content.setMinimumWidth(300)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(6, 8, 6, 6)
+        layout.setSpacing(10)
+        for group in groups:
+            layout.addWidget(group)
+        layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        return scroll
+    # -- End of sidebar tabs --------------------------------------------
+
+    def run_long_task(
+        self,
+        title: str,
+        work: Callable[[Callable[[float], None]], object],
+        on_done: Optional[Callable[[object], object]] = None,
+    ) -> Optional[str]:
+        """Real-progress pop-up for slow calculations (see run_with_real_progress)."""
+        return run_with_real_progress(self, title, work, on_done)
+
+    def _attach_progress_popups(self) -> None:
+        wiring = (
+            (
+                self._avg_baseline_action.triggered,
+                "Averaging Baseline",
+                lambda: self._average_trace("Baseline"),
+            ),
+            (
+                self._avg_standard_action.triggered,
+                "Averaging Standard",
+                lambda: self._average_trace("Standard"),
+            ),
+            (
+                self._avg_sample_action.triggered,
+                "Averaging Sample",
+                lambda: self._average_trace("Sample"),
+            ),
+            (
+                self._avg_all_btn.clicked,
+                "Averaging all traces",
+                self._average_all_traces,
+            ),
+            (
+                self._interp_baseline_action.triggered,
+                "Interpolating Baseline",
+                lambda: self._interpolate_selected("Baseline"),
+            ),
+            (
+                self._interp_standard_action.triggered,
+                "Interpolating Standard",
+                lambda: self._interpolate_selected("Standard"),
+            ),
+            (
+                self._interp_sample_action.triggered,
+                "Interpolating Sample",
+                lambda: self._interpolate_selected("Sample"),
+            ),
+            (
+                self._interpolate_all_btn.clicked,
+                "Interpolating all traces",
+                self._interpolate_all,
+            ),
+            (
+                self._reflectance_btn.clicked,
+                "Calculating Relative Reflectance",
+                self._calculate_reflectance,
+            ),
+            (
+                self._interp_reflectance_btn.clicked,
+                "Interpolating Relative Reflectance",
+                self._interpolate_reflectance,
+            ),
+            (
+                self._interp_si_btn.clicked,
+                "Interpolating Si (n and k)",
+                self._interpolate_silicon,
+            ),
+            (
+                self._si_reflectance_btn.clicked,
+                "Calculating Si Reflectance",
+                self._calculate_si_reflectance,
+            ),
+        )
+        for signal, title, action in wiring:
+            signal.disconnect()  # remove the original direct connection
+            signal.connect(partial(self._run_with_progress, title, action))
+
+        # Keep the Si reflectance consistent when Si values or measurements
+        # are imported again. These extra connections run after the original
+        # handlers and only clear the added Si reflectance columns.
+        self._import_si_btn.clicked.connect(self._sync_si_reflectance)
+        self._import_csv_btn.clicked.connect(self._sync_si_reflectance)
+
+    def _table_snapshot(self) -> tuple[int, list[tuple[str, object, str]]]:
+        """Row count plus every column (header, array object, kind), read-only."""
+        return (self._model.rowCount(), list(self._model._columns))
+
+    @staticmethod
+    def _snapshots_differ(
+        before: tuple[int, list[tuple[str, object, str]]],
+        after: tuple[int, list[tuple[str, object, str]]],
+    ) -> bool:
+        if before[0] != after[0] or len(before[1]) != len(after[1]):
+            return True
+        return any(
+            h1 != h2 or k1 != k2 or s1 is not s2
+            for (h1, s1, k1), (h2, s2, k2) in zip(before[1], after[1])
+        )
+
+    def _run_with_progress(
+        self, title: str, action: Callable[[], object], *_signal_args: object
+    ) -> None:
+        before = self._table_snapshot()
+        popup = ProgressPopup(title, parent=self)
+        try:
+            popup.run_handler(
+                action,
+                lambda: self._snapshots_differ(before, self._table_snapshot()),
+            )
+        finally:
+            popup.deleteLater()
+        self._sync_si_reflectance()
+
+    # -- Si reflectance (added) -----------------------------------------
+    def _build_si_reflectance_group(self) -> QGroupBox:
+        """Nd and Nk tab: calculate the reflectance of bare silicon."""
+        group = QGroupBox("Si Reflectance")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+        note = QLabel(
+            "Bare silicon in air, s-polarized, at 0° and 60°. Uses the "
+            "interpolated Si n and k if available, otherwise the imported values."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #9aa3b2;")
+        layout.addWidget(note)
+
+        self._si_reflectance_btn = QPushButton("Calculate Si Reflectance")
+        self._si_reflectance_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._si_reflectance_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._si_reflectance_btn.setToolTip(
+            "Add Si R0 (0°) and Si R60 (60°, s-pol) columns calculated from Si n and k"
+        )
+        self._si_reflectance_btn.clicked.connect(self._calculate_si_reflectance)
+        layout.addWidget(self._si_reflectance_btn)
+        return group
+
+    def _si_reflectance_source(
+        self,
+    ) -> Optional[tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
+        """Interpolated Si n, k when available, otherwise the imported values."""
+        if (
+            self.si_interp_wavelength is not None
+            and self.si_interp_n is not None
+            and self.si_interp_k is not None
+            and self.si_interp_wavelength.size > 0
+        ):
+            return (
+                "interpolated Si n, k",
+                self.si_interp_wavelength,
+                self.si_interp_n,
+                self.si_interp_k,
+            )
+        if (
+            self.si_wavelength is not None
+            and self.si_n is not None
+            and self.si_k is not None
+            and self.si_wavelength.size > 0
+        ):
+            return ("imported Si n, k", self.si_wavelength, self.si_n, self.si_k)
+        return None
+
+    def _calculate_si_reflectance(self) -> bool:
+        """Add Si R0 (0°) and Si R60 (60°, s-pol) columns to the table."""
+        source = self._si_reflectance_source()
+        if source is None:
+            QMessageBox.warning(
+                self,
+                "Silicon Data Required",
+                "Import Si values before calculating Si reflectance.",
+            )
+            return False
+        label, wavelengths, n_values, k_values = source
+        try:
+            r0 = bare_substrate_reflectance_s(n_values, k_values, _SI_R_ANGLES_DEG[0])
+            r60 = bare_substrate_reflectance_s(n_values, k_values, _SI_R_ANGLES_DEG[1])
+        except Exception as exc:
+            logger.exception("Si reflectance calculation failed")
+            QMessageBox.critical(self, "Calculation Failed", str(exc))
+            return False
+
+        wl = np.asarray(wavelengths, dtype=np.float64).copy()
+        _replace_model_columns(
+            self._model,
+            _SI_R_KINDS,
+            [
+                ("Si R Wavelength (nm)", wl, "si_r_wl"),
+                ("Si R0 (0°)", r0, "si_r0"),
+                ("Si R60 (60°, s-pol)", r60, "si_r60"),
+            ],
+        )
+        self.si_reflectance = {
+            "wavelength": wl.copy(),
+            "R0": r0.copy(),
+            "R60": r60.copy(),
+            "source": label,
+        }
+        self._si_reflectance_inputs = (wavelengths, n_values, k_values)
+
+        self._table.resizeColumnsToContents()
+        first_col = next(
+            index
+            for index, column in enumerate(self._model._columns)
+            if column[2] == "si_r_wl"
+        )
+        self._table.scrollTo(self._model.index(0, first_col))
+        finite = np.isfinite(r0) & np.isfinite(r60)
+        ranges = ""
+        if finite.any():
+            ranges = (
+                f"  ·  R0 {r0[finite].min():.4f}–{r0[finite].max():.4f}"
+                f"  ·  R60 {r60[finite].min():.4f}–{r60[finite].max():.4f}"
+            )
+        self._summary.setText(
+            f"Optical mode: {self._mode_display}  ·  Si reflectance: "
+            f"{wl.size} points from {label} "
+            f"({wl[0]:.3f}–{wl[-1]:.3f} nm){ranges}"
+        )
+        return True
+
+    def _sync_si_reflectance(self, *_signal_args: object) -> None:
+        """Keep the Si reflectance columns consistent with the Si n, k data.
+
+        - Si n, k changed (re-import / re-interpolate): clear the result.
+        - Columns removed by the original measurement Import (it drops all
+          added columns) while Si n, k is unchanged: put them back, since
+          Si reflectance does not depend on the measurements.
+        """
+        if self._si_reflectance_inputs is None or self.si_reflectance is None:
+            return
+        source = self._si_reflectance_source()
+        same_inputs = source is not None and all(
+            current is used
+            for current, used in zip(source[1:], self._si_reflectance_inputs)
+        )
+        has_columns = any(kind in _SI_R_KINDS for _h, _s, kind in self._model._columns)
+        if same_inputs:
+            if not has_columns:
+                stored = self.si_reflectance
+                _replace_model_columns(
+                    self._model,
+                    _SI_R_KINDS,
+                    [
+                        ("Si R Wavelength (nm)", np.array(stored["wavelength"]), "si_r_wl"),
+                        ("Si R0 (0°)", np.array(stored["R0"]), "si_r0"),
+                        ("Si R60 (60°, s-pol)", np.array(stored["R60"]), "si_r60"),
+                    ],
+                )
+                self._table.resizeColumnsToContents()
+            return
+        if has_columns:
+            _replace_model_columns(self._model, _SI_R_KINDS, [])
+            self._table.resizeColumnsToContents()
+        self.si_reflectance = None
+        self._si_reflectance_inputs = None
+        self._summary.setText(
+            self._summary.text()
+            + "  ·  Si reflectance cleared (Si values changed, recalculate)"
+        )
+    # -- End of Si reflectance ------------------------------------------
+
+
+# ===========================================================================
+# END OF ADDED FEATURE
+# ===========================================================================
+
+
 class SpectrometerApp(QMainWindow):
     """Main window: live spectrum, multi-geometry capture slots, and export."""
 
@@ -3182,7 +4042,7 @@ class SpectrometerApp(QMainWindow):
             return
 
         slot = self._current_slot()
-        dialog = PostProcessDialog(
+        dialog = PostProcessDialogWithProgress(
             mode_display=self._active_display(),
             mode_key=self._active_geometry,
             wavelengths=wavelengths,
