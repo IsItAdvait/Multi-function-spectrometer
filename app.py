@@ -4880,6 +4880,325 @@ class SpectrometerAppWithNdNk(SpectrometerApp):
 # ===========================================================================
 
 
+# ===========================================================================
+# ADDED FEATURE: Excel import
+# ---------------------------------------------------------------------------
+# Lets every import button read Excel files as well as CSV files:
+#   * Import CSV Data (main window) and Import (Post Process): measurement
+#     files can be .xlsx / .xlsm (and old .xls when the xlrd package is
+#     installed). The file chooser now lists CSV and Excel files.
+#   * Import Si Values (Post Process and the Nd and Nk window): Excel files no
+#     longer need pandas. They are read with openpyxl, or with a small built-in
+#     reader when openpyxl is not installed (for example in the .exe).
+#   * Also fixed on the way in: CSV files saved by Excel in the Windows code
+#     page instead of UTF-8, and Excel files renamed to .csv, which the
+#     original import could not read.
+#
+# How it works: the two original reader functions are wrapped. An Excel sheet
+# is turned into the same rows a CSV file would give and handed to the
+# ORIGINAL parser, so column detection, checks and messages are exactly the
+# same as for CSV files. CSV files that already worked go to the original code
+# unchanged. Title rows above the header row in an Excel sheet are skipped, and
+# the first sheet that contains data is used. Exporting is not changed.
+#
+# To remove this feature: delete this block.
+# ===========================================================================
+
+import io  # noqa: E402  (imports used only by this block)
+import os  # noqa: E402
+import tempfile  # noqa: E402
+import warnings  # noqa: E402
+import xml.etree.ElementTree as ElementTree  # noqa: E402
+import zipfile  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
+
+_EXCEL_SUFFIXES = frozenset({".xlsx", ".xlsm", ".xls"})
+_ZIP_SIGNATURE = b"PK\x03\x04"  # .xlsx / .xlsm files are zip archives
+_OLE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # old binary .xls files
+
+# The original functions, kept so the wrappers below can call them.
+_original_parse_unified_measurement_csv = parse_unified_measurement_csv
+_original_load_table_rows = _load_table_rows
+
+
+def _file_signature(path: Path, size: int = 8) -> bytes:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(size)
+    except OSError:
+        return b""
+
+
+def _looks_like_excel(path: Path) -> bool:
+    signature = _file_signature(path)
+    return (
+        path.suffix.lower() in _EXCEL_SUFFIXES
+        or signature.startswith(_ZIP_SIGNATURE)
+        or signature.startswith(_OLE_SIGNATURE)
+    )
+
+
+def _excel_cell_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _xlsx_sheets_openpyxl(path: Path) -> list[list[list[str]]]:
+    import openpyxl  # ImportError -> the built-in reader is used instead
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # Opened from bytes so the file name's extension does not matter.
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(path.read_bytes()), read_only=True, data_only=True
+        )
+    try:
+        return [
+            [
+                [_excel_cell_text(value) for value in row]
+                for row in sheet.iter_rows(values_only=True)
+            ]
+            for sheet in workbook.worksheets
+        ]
+    finally:
+        workbook.close()
+
+
+def _xlsx_sheets_builtin(path: Path) -> list[list[list[str]]]:
+    """Minimal .xlsx reader (values only) using just the standard library."""
+    main_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    rel_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    pkg_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in names:
+            root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.iter(f"{main_ns}si"):
+                shared.append("".join(t.text or "" for t in item.iter(f"{main_ns}t")))
+        targets: dict[str, str] = {}
+        if "xl/_rels/workbook.xml.rels" in names:
+            rels = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            for rel in rels.iter(f"{pkg_ns}Relationship"):
+                target = rel.get("Target", "").lstrip("/")
+                if not target.startswith("xl/"):
+                    target = "xl/" + target
+                targets[rel.get("Id", "")] = target
+        workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        sheet_paths = [
+            targets.get(sheet.get(f"{rel_ns}id", ""), "")
+            for sheet in workbook.iter(f"{main_ns}sheet")
+        ]
+        sheets: list[list[list[str]]] = []
+        for sheet_path in sheet_paths:
+            if sheet_path not in names:
+                continue
+            root = ElementTree.fromstring(archive.read(sheet_path))
+            rows: list[list[str]] = []
+            for row in root.iter(f"{main_ns}row"):
+                cells: dict[int, str] = {}
+                for index, cell in enumerate(row.iter(f"{main_ns}c")):
+                    ref = cell.get("r", "")
+                    letters = "".join(ch for ch in ref if ch.isalpha())
+                    column = index
+                    if letters:
+                        column = 0
+                        for ch in letters.upper():
+                            column = column * 26 + (ord(ch) - ord("A") + 1)
+                        column -= 1
+                    kind = cell.get("t", "n")
+                    value_el = cell.find(f"{main_ns}v")
+                    text = value_el.text if value_el is not None and value_el.text else ""
+                    if kind == "s" and text:
+                        text = shared[int(text)]
+                    elif kind == "inlineStr":
+                        text = "".join(t.text or "" for t in cell.iter(f"{main_ns}t"))
+                    cells[column] = text.strip()
+                width = max(cells) + 1 if cells else 0
+                rows.append([cells.get(column, "") for column in range(width)])
+            sheets.append(rows)
+        return sheets
+
+
+def _xls_sheets(path: Path) -> list[list[list[str]]]:
+    try:
+        import xlrd
+    except ImportError as exc:
+        raise MeasurementCsvError(
+            "This is an old-format Excel file (.xls). Open it in Excel and use "
+            "File > Save As > Excel Workbook (.xlsx), then import the .xlsx file."
+        ) from exc
+    book = xlrd.open_workbook(str(path))
+    return [
+        [
+            [_excel_cell_text(sheet.cell_value(row, column)) for column in range(sheet.ncols)]
+            for row in range(sheet.nrows)
+        ]
+        for sheet in book.sheets()
+    ]
+
+
+def _trim_excel_rows(rows: list[list[str]]) -> list[list[str]]:
+    """Drop blank rows, trailing empty cells, and title rows above the header."""
+    cleaned = []
+    for row in rows:
+        while row and not row[-1]:
+            row = row[:-1]
+        if any(cell for cell in row):
+            cleaned.append(row)
+    first_data = next(
+        (index for index, row in enumerate(cleaned) if _row_looks_numeric(row)), None
+    )
+    if first_data is not None and first_data > 1:
+        cleaned = cleaned[first_data - 1 :]  # keep the header row just above the data
+    return cleaned
+
+
+def _read_excel_rows(path: Path) -> list[list[str]]:
+    """Rows (as strings) of the first sheet in an Excel file that has data."""
+    try:
+        if _file_signature(path).startswith(_OLE_SIGNATURE):
+            sheets = _xls_sheets(path)
+        else:
+            try:
+                sheets = _xlsx_sheets_openpyxl(path)
+            except ImportError:
+                sheets = _xlsx_sheets_builtin(path)
+            except Exception as openpyxl_error:
+                # Some programs write workbooks openpyxl rejects; try the
+                # built-in reader before giving up.
+                try:
+                    sheets = _xlsx_sheets_builtin(path)
+                except Exception:
+                    raise openpyxl_error
+    except MeasurementCsvError:
+        raise
+    except Exception as exc:
+        raise MeasurementCsvError(f"Could not read Excel file: {exc}") from exc
+    for rows in sheets:
+        cleaned = _trim_excel_rows(rows)
+        if cleaned:
+            return cleaned
+    raise MeasurementCsvError("The Excel file does not contain any data.")
+
+
+def _read_text_any_encoding(path: Path) -> str:
+    raw = path.read_bytes()
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1")  # never fails
+
+
+@contextmanager
+def _temporary_csv(rows: Optional[list[list[str]]] = None, text: Optional[str] = None):
+    """A temporary UTF-8 CSV file with these rows (or this text)."""
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".csv", delete=False, encoding="utf-8", newline=""
+    )
+    try:
+        with handle:
+            if rows is not None:
+                csv.writer(handle).writerows(rows)
+            else:
+                handle.write(text or "")
+        yield Path(handle.name)
+    finally:
+        try:
+            os.remove(handle.name)
+        except OSError:
+            pass
+
+
+def parse_unified_measurement_csv(  # noqa: F811  (wraps the original)
+    path: Path,
+) -> tuple[np.ndarray, dict[Optional[str], dict[str, np.ndarray]]]:
+    """Excel-aware wrapper around the original measurement-file parser."""
+    path = Path(path)
+    if _looks_like_excel(path):
+        rows = _read_excel_rows(path)
+        with _temporary_csv(rows=rows) as temp_path:
+            return _original_parse_unified_measurement_csv(temp_path)
+    try:
+        return _original_parse_unified_measurement_csv(path)
+    except UnicodeDecodeError:
+        try:
+            text = _read_text_any_encoding(path)
+        except OSError as exc:
+            raise MeasurementCsvError(f"Could not read file: {exc}") from exc
+        with _temporary_csv(text=text) as temp_path:
+            return _original_parse_unified_measurement_csv(temp_path)
+
+
+def _load_table_rows(path: Path) -> list[list[str]]:  # noqa: F811  (wraps the original)
+    """Excel-aware wrapper around the original Si-file reader."""
+    path = Path(path)
+    if _looks_like_excel(path):
+        return _read_excel_rows(path)
+    try:
+        return _original_load_table_rows(path)
+    except UnicodeDecodeError:
+        try:
+            text = _read_text_any_encoding(path)
+        except OSError as exc:
+            raise MeasurementCsvError(f"Could not read file: {exc}") from exc
+        return list(csv.reader(text.splitlines()))
+
+
+# File chooser: the two measurement import buttons only offered CSV files.
+# While one of them runs, the CSV-only filter is swapped for one that also
+# lists Excel files.
+_CSV_ONLY_FILTER = "CSV Files (*.csv);;All Files (*)"
+_CSV_AND_EXCEL_FILTER = (
+    "CSV or Excel Files (*.csv *.xlsx *.xlsm *.xls);;CSV Files (*.csv);;"
+    "Excel Files (*.xlsx *.xlsm *.xls);;All Files (*)"
+)
+
+
+@contextmanager
+def _file_chooser_with_excel():
+    original = QFileDialog.getOpenFileName
+
+    def get_open_file_name(*args, **kwargs):
+        args = list(args)
+        if len(args) >= 4 and args[3] == _CSV_ONLY_FILTER:
+            args[3] = _CSV_AND_EXCEL_FILTER
+        if kwargs.get("filter") == _CSV_ONLY_FILTER:
+            kwargs["filter"] = _CSV_AND_EXCEL_FILTER
+        return original(*args, **kwargs)
+
+    QFileDialog.getOpenFileName = get_open_file_name
+    try:
+        yield
+    finally:
+        QFileDialog.getOpenFileName = original
+
+
+def _with_excel_in_file_chooser(method: Callable[..., object]) -> Callable[..., object]:
+    def wrapper(self, *_signal_args: object) -> object:
+        with _file_chooser_with_excel():
+            return method(self)
+
+    wrapper.__name__ = method.__name__
+    wrapper.__doc__ = method.__doc__
+    return wrapper
+
+
+SpectrometerApp._import_csv_data = _with_excel_in_file_chooser(
+    SpectrometerApp._import_csv_data
+)
+PostProcessDialog._import_measurement_csv = _with_excel_in_file_chooser(
+    PostProcessDialog._import_measurement_csv
+)
+
+# ===========================================================================
+# END OF ADDED FEATURE: Excel import
+# ===========================================================================
+
+
 def main() -> int:
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
