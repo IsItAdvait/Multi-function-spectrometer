@@ -2377,10 +2377,6 @@ class PostProcessDialog(QDialog):
 #    and the window (including the live plot) never freezes. Use this for
 #    anything that can take more than about a second, e.g. the planned
 #    d1/n1 and n1(λ)/k1(λ) solvers.
-#
-# The post-processing sidebar is split into two tabs ("Original" and
-# "Nd and Nk"). The Nd and Nk tab holds Silicon Calibration and the new
-# Si Reflectance step (bare-silicon reflectance at 0° and 60°, s-polarized).
 # ===========================================================================
 
 import threading  # noqa: E402  (imports used only by this block)
@@ -2388,7 +2384,7 @@ import time  # noqa: E402
 from functools import partial  # noqa: E402
 
 from PyQt6.QtCore import QElapsedTimer, QObject, pyqtSignal, pyqtSlot  # noqa: E402
-from PyQt6.QtWidgets import QProgressBar, QTabWidget  # noqa: E402
+from PyQt6.QtWidgets import QProgressBar  # noqa: E402
 
 # Timed fill used for the existing (fast, GUI-thread) buttons.
 _PROGRESS_FILL_MS: int = 800
@@ -2787,65 +2783,15 @@ def run_with_real_progress(
         popup.deleteLater()
 
 
-# ---------------------------------------------------------------------------
-# Silicon reflectance (used by the "Nd and Nk" tab)
-# ---------------------------------------------------------------------------
-
-# Angles of incidence in degrees, matching the R₀ and R₆₀ optical modes.
-_SI_R_ANGLES_DEG: tuple[float, float] = (0.0, 60.0)
-# Table column kinds used for the calculated Si reflectance.
-_SI_R_KINDS: frozenset[str] = frozenset({"si_r_wl", "si_r0", "si_r60"})
-
-
-def bare_substrate_reflectance_s(
-    n2: np.ndarray, k2: np.ndarray, angle_deg: float, n0: float = 1.0
-) -> np.ndarray:
-    """Reflectance |r|² of an uncoated substrate in air, s-polarized.
-
-    This is the formula of Optical_Nd_V7S.py / Optical_NK_V7S.py with no film
-    (d1 = 0): the input admittance Y then equals the substrate admittance η2,
-    so r = (η0 − η2) / (η0 + η2) with η = N·cos θ (s-wave) and N = n − ik.
-    At 0° the s and p polarizations are identical. Works element-wise on
-    arrays of n2 and k2; NaN inputs give NaN.
-    """
-    with np.errstate(all="ignore"):
-        n_sub = np.asarray(n2, dtype=np.float64) - 1j * np.asarray(k2, dtype=np.float64)
-        n_amb = complex(n0, 0.0)
-        theta0 = math.radians(angle_deg)
-        theta2 = np.arcsin(n_amb / n_sub * math.sin(theta0))  # Snell's law
-        eta0 = n_amb * math.cos(theta0)
-        eta2 = n_sub * np.cos(theta2)
-        r = (eta0 - eta2) / (eta0 + eta2)
-        return (r * np.conj(r)).real
-
-
-def _replace_model_columns(
-    model: SpectrumTableModel,
-    kinds: frozenset[str],
-    new_columns: list[tuple[str, np.ndarray, str]],
-) -> None:
-    """Remove all columns of ``kinds`` from the table and append ``new_columns``.
-
-    Same approach as SpectrumTableModel's own Si methods (full model reset;
-    the row count grows if a new column is longer than the table).
-    """
-    model.beginResetModel()
-    for _header, series, _kind in new_columns:
-        model._n = max(model._n, int(np.asarray(series).size))
-    model._columns = [column for column in model._columns if column[2] not in kinds]
-    model._columns.extend(new_columns)
-    model.endResetModel()
-
-
 class PostProcessDialogWithProgress(PostProcessDialog):
-    """PostProcessDialog with progress pop-ups, sidebar tabs and new Nd/Nk tools.
+    """PostProcessDialog whose calculation buttons run inside ProgressPopup.
 
     The original handler methods are called unchanged. Only the signal
     connections of these buttons/menu items are swapped for wrappers:
     Average trace (Baseline/Standard/Sample), Average All,
     Interpolate (Baseline/Standard/Sample), Interpolate all,
     Relative Reflectance, Interpolate Relative Reflectance,
-    Interpolate Si (n and k), and the new Calculate Si Reflectance.
+    Interpolate Si (n and k).
     Import, Export, Import Si Values and Back keep their original wiring.
 
     New long-running features should call ``self.run_long_task(...)``.
@@ -2853,99 +2799,7 @@ class PostProcessDialogWithProgress(PostProcessDialog):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Calculated Si reflectance: {"wavelength", "R0", "R60", "source"}.
-        self.si_reflectance: Optional[dict[str, object]] = None
-        # The Si wavelength / n / k arrays it was calculated from.
-        self._si_reflectance_inputs: Optional[tuple[np.ndarray, ...]] = None
         self._attach_progress_popups()
-
-    # -- Sidebar tabs (added) -------------------------------------------
-    # Tab titles: rename here later if needed.
-    _ORIGINAL_TAB_TITLE = "Original"
-    _ND_NK_TAB_TITLE = "Nd and Nk"
-
-    def _build_sidebar(self) -> QWidget:
-        """Two-tab sidebar instead of one scrolling column.
-
-        Overrides PostProcessDialog._build_sidebar (which stays unchanged) and
-        reuses the original group builders, so every control keeps its
-        original behaviour. The table on the right stays visible on both tabs.
-          "Original"  : Average, Interpolation, Reflectance
-          "Nd and Nk" : Silicon Calibration, Si Reflectance
-                        (future n / k / d tools go here)
-        """
-        self._sidebar_tabs = QTabWidget()
-        self._sidebar_tabs.setObjectName("sidebarTabs")
-        self._sidebar_tabs.setStyleSheet(
-            """
-            QTabWidget#sidebarTabs::pane {
-                border: 1px solid #3d4450;
-                border-radius: 6px;
-                top: -1px;
-            }
-            QTabWidget#sidebarTabs > QTabBar::tab {
-                background-color: #1a1e26;
-                color: #8b93a3;
-                border: 1px solid #3a4150;
-                border-bottom: none;
-                border-top-left-radius: 6px;
-                border-top-right-radius: 6px;
-                padding: 6px 16px;
-                margin-right: 2px;
-                font-weight: 600;
-            }
-            QTabWidget#sidebarTabs > QTabBar::tab:selected {
-                background-color: #123e4f;
-                color: #e8fbff;
-                border: 1px solid #00bcd4;
-                border-bottom: none;
-            }
-            QTabWidget#sidebarTabs > QTabBar::tab:hover:!selected {
-                background-color: #353b48;
-                color: #e8eaed;
-            }
-            """
-        )
-        self._sidebar_tabs.addTab(
-            self._make_sidebar_page(
-                self._build_average_group(),
-                self._build_interpolation_group(),
-                self._build_reflectance_group(),
-            ),
-            self._ORIGINAL_TAB_TITLE,
-        )
-        self._sidebar_tabs.addTab(
-            self._make_sidebar_page(
-                self._build_silicon_group(),
-                self._build_si_reflectance_group(),
-            ),
-            self._ND_NK_TAB_TITLE,
-        )
-        self._sidebar_tabs.setFixedWidth(336)
-        self._sidebar_tabs.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
-        )
-        return self._sidebar_tabs
-
-    @staticmethod
-    def _make_sidebar_page(*groups: QWidget) -> QScrollArea:
-        """One scrollable tab page, laid out like the original sidebar."""
-        content = QWidget()
-        content.setMinimumWidth(300)
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(6, 8, 6, 6)
-        layout.setSpacing(10)
-        for group in groups:
-            layout.addWidget(group)
-        layout.addStretch(1)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(content)
-        return scroll
-    # -- End of sidebar tabs --------------------------------------------
 
     def run_long_task(
         self,
@@ -3013,21 +2867,10 @@ class PostProcessDialogWithProgress(PostProcessDialog):
                 "Interpolating Si (n and k)",
                 self._interpolate_silicon,
             ),
-            (
-                self._si_reflectance_btn.clicked,
-                "Calculating Si Reflectance",
-                self._calculate_si_reflectance,
-            ),
         )
         for signal, title, action in wiring:
             signal.disconnect()  # remove the original direct connection
             signal.connect(partial(self._run_with_progress, title, action))
-
-        # Keep the Si reflectance consistent when Si values or measurements
-        # are imported again. These extra connections run after the original
-        # handlers and only clear the added Si reflectance columns.
-        self._import_si_btn.clicked.connect(self._sync_si_reflectance)
-        self._import_csv_btn.clicked.connect(self._sync_si_reflectance)
 
     def _table_snapshot(self) -> tuple[int, list[tuple[str, object, str]]]:
         """Row count plus every column (header, array object, kind), read-only."""
@@ -3057,157 +2900,6 @@ class PostProcessDialogWithProgress(PostProcessDialog):
             )
         finally:
             popup.deleteLater()
-        self._sync_si_reflectance()
-
-    # -- Si reflectance (added) -----------------------------------------
-    def _build_si_reflectance_group(self) -> QGroupBox:
-        """Nd and Nk tab: calculate the reflectance of bare silicon."""
-        group = QGroupBox("Si Reflectance")
-        layout = QVBoxLayout(group)
-        layout.setSpacing(8)
-        note = QLabel(
-            "Bare silicon in air, s-polarized, at 0° and 60°. Uses the "
-            "interpolated Si n and k if available, otherwise the imported values."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #9aa3b2;")
-        layout.addWidget(note)
-
-        self._si_reflectance_btn = QPushButton("Calculate Si Reflectance")
-        self._si_reflectance_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._si_reflectance_btn.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self._si_reflectance_btn.setToolTip(
-            "Add Si R0 (0°) and Si R60 (60°, s-pol) columns calculated from Si n and k"
-        )
-        self._si_reflectance_btn.clicked.connect(self._calculate_si_reflectance)
-        layout.addWidget(self._si_reflectance_btn)
-        return group
-
-    def _si_reflectance_source(
-        self,
-    ) -> Optional[tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
-        """Interpolated Si n, k when available, otherwise the imported values."""
-        if (
-            self.si_interp_wavelength is not None
-            and self.si_interp_n is not None
-            and self.si_interp_k is not None
-            and self.si_interp_wavelength.size > 0
-        ):
-            return (
-                "interpolated Si n, k",
-                self.si_interp_wavelength,
-                self.si_interp_n,
-                self.si_interp_k,
-            )
-        if (
-            self.si_wavelength is not None
-            and self.si_n is not None
-            and self.si_k is not None
-            and self.si_wavelength.size > 0
-        ):
-            return ("imported Si n, k", self.si_wavelength, self.si_n, self.si_k)
-        return None
-
-    def _calculate_si_reflectance(self) -> bool:
-        """Add Si R0 (0°) and Si R60 (60°, s-pol) columns to the table."""
-        source = self._si_reflectance_source()
-        if source is None:
-            QMessageBox.warning(
-                self,
-                "Silicon Data Required",
-                "Import Si values before calculating Si reflectance.",
-            )
-            return False
-        label, wavelengths, n_values, k_values = source
-        try:
-            r0 = bare_substrate_reflectance_s(n_values, k_values, _SI_R_ANGLES_DEG[0])
-            r60 = bare_substrate_reflectance_s(n_values, k_values, _SI_R_ANGLES_DEG[1])
-        except Exception as exc:
-            logger.exception("Si reflectance calculation failed")
-            QMessageBox.critical(self, "Calculation Failed", str(exc))
-            return False
-
-        wl = np.asarray(wavelengths, dtype=np.float64).copy()
-        _replace_model_columns(
-            self._model,
-            _SI_R_KINDS,
-            [
-                ("Si R Wavelength (nm)", wl, "si_r_wl"),
-                ("Si R0 (0°)", r0, "si_r0"),
-                ("Si R60 (60°, s-pol)", r60, "si_r60"),
-            ],
-        )
-        self.si_reflectance = {
-            "wavelength": wl.copy(),
-            "R0": r0.copy(),
-            "R60": r60.copy(),
-            "source": label,
-        }
-        self._si_reflectance_inputs = (wavelengths, n_values, k_values)
-
-        self._table.resizeColumnsToContents()
-        first_col = next(
-            index
-            for index, column in enumerate(self._model._columns)
-            if column[2] == "si_r_wl"
-        )
-        self._table.scrollTo(self._model.index(0, first_col))
-        finite = np.isfinite(r0) & np.isfinite(r60)
-        ranges = ""
-        if finite.any():
-            ranges = (
-                f"  ·  R0 {r0[finite].min():.4f}–{r0[finite].max():.4f}"
-                f"  ·  R60 {r60[finite].min():.4f}–{r60[finite].max():.4f}"
-            )
-        self._summary.setText(
-            f"Optical mode: {self._mode_display}  ·  Si reflectance: "
-            f"{wl.size} points from {label} "
-            f"({wl[0]:.3f}–{wl[-1]:.3f} nm){ranges}"
-        )
-        return True
-
-    def _sync_si_reflectance(self, *_signal_args: object) -> None:
-        """Keep the Si reflectance columns consistent with the Si n, k data.
-
-        - Si n, k changed (re-import / re-interpolate): clear the result.
-        - Columns removed by the original measurement Import (it drops all
-          added columns) while Si n, k is unchanged: put them back, since
-          Si reflectance does not depend on the measurements.
-        """
-        if self._si_reflectance_inputs is None or self.si_reflectance is None:
-            return
-        source = self._si_reflectance_source()
-        same_inputs = source is not None and all(
-            current is used
-            for current, used in zip(source[1:], self._si_reflectance_inputs)
-        )
-        has_columns = any(kind in _SI_R_KINDS for _h, _s, kind in self._model._columns)
-        if same_inputs:
-            if not has_columns:
-                stored = self.si_reflectance
-                _replace_model_columns(
-                    self._model,
-                    _SI_R_KINDS,
-                    [
-                        ("Si R Wavelength (nm)", np.array(stored["wavelength"]), "si_r_wl"),
-                        ("Si R0 (0°)", np.array(stored["R0"]), "si_r0"),
-                        ("Si R60 (60°, s-pol)", np.array(stored["R60"]), "si_r60"),
-                    ],
-                )
-                self._table.resizeColumnsToContents()
-            return
-        if has_columns:
-            _replace_model_columns(self._model, _SI_R_KINDS, [])
-            self._table.resizeColumnsToContents()
-        self.si_reflectance = None
-        self._si_reflectance_inputs = None
-        self._summary.setText(
-            self._summary.text()
-            + "  ·  Si reflectance cleared (Si values changed, recalculate)"
-        )
-    # -- End of Si reflectance ------------------------------------------
 
 
 # ===========================================================================
@@ -4301,6 +3993,893 @@ class SpectrometerApp(QMainWindow):
         self.statusBar().showMessage(text)
 
 
+# ===========================================================================
+# ADDED FEATURE: Nd and Nk window
+# ---------------------------------------------------------------------------
+# A separate window, opened by the "Nd and Nk" button at the right end of the
+# main window's top row (next to the R0 / R60 / T mode buttons).
+# Stage 1: measurements (R0 and R60), silicon reference and absolute
+# reflectance. The table shows every step: measurements, averages, averages
+# resampled onto the grid, relative reflectance, Si values and absolute
+# reflectance. Each button has a footnote saying what it still needs, and a
+# pop-up if it is clicked before then. Later stages add the Nd and Nk fits.
+#
+# Everything in this block is new. The original code is unchanged apart from
+# one word in main():  SpectrometerApp()  ->  SpectrometerAppWithNdNk()
+# It uses ProgressPopup from the progress pop-up block above SpectrometerApp,
+# the original helper functions (averaging, relative reflectance,
+# interpolation, Si file parsing), and the physics in thin_film.py.
+#
+# Remembering: one window lives on the main window, so closing and reopening
+# it keeps everything. All calculated results are cleared as soon as the R0 or
+# R60 measurements change (capture, import or reset). Imported Si values and
+# the settings in the fields are kept.
+#
+# To remove this feature: delete this block, change main() back to
+# SpectrometerApp(), and delete thin_film.py.
+# ===========================================================================
+
+import thin_film  # noqa: E402
+
+# Optical modes used by the Nd and Nk fits, with the angle each one measures.
+_ND_NK_MODES: tuple[tuple[str, float], ...] = (("R0", 0.0), ("R60", 60.0))
+_ND_NK_SLOTS: tuple[str, ...] = CAPTURE_LABELS
+
+_ND_NK_STYLE = """
+QDialog {
+    background-color: #12141a;
+    color: #e8eaed;
+}
+QScrollArea {
+    background-color: transparent;
+    border: none;
+}
+QScrollArea > QWidget > QWidget {
+    background-color: transparent;
+}
+QLabel {
+    color: #c5cad4;
+}
+QLabel#ndNkNote {
+    color: #9aa3b2;
+}
+QGroupBox {
+    color: #e8eaed;
+    border: 1px solid #3d4450;
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 8px;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+}
+QTableView {
+    background-color: #1a1d23;
+    alternate-background-color: #21252d;
+    gridline-color: #2e3440;
+    color: #e8eaed;
+    selection-background-color: #2a4568;
+    border: 1px solid #3d4450;
+}
+QHeaderView::section {
+    background-color: #242a35;
+    color: #e8eaed;
+    padding: 6px;
+    border: 1px solid #3d4450;
+    font-weight: 600;
+}
+QPushButton {
+    background-color: #2a2f3a;
+    border: 1px solid #3d4450;
+    border-radius: 6px;
+    padding: 2px 16px;
+    min-height: 22px;
+    color: #e8eaed;
+}
+QPushButton:hover {
+    background-color: #353b48;
+}
+QPushButton:disabled {
+    color: #6d7480;
+}
+QPushButton#accentBtn {
+    background-color: #123e4f;
+    border: 1px solid #00bcd4;
+    color: #e8fbff;
+    font-weight: 600;
+}
+QPushButton#accentBtn:hover:!disabled {
+    background-color: #16566c;
+}
+QSpinBox, QComboBox, QLineEdit {
+    background-color: #1e2229;
+    border: 1px solid #3d4450;
+    border-radius: 4px;
+    padding: 4px 8px;
+    min-height: 26px;
+    color: #e8eaed;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+    border: 1px solid #00bcd4;
+}
+"""
+
+
+class _NdNkTableModel(QAbstractTableModel):
+    """Read-only table of named columns. Shorter columns show blank cells,
+    NaN values show "N/A"; numbers use 6 decimals like the Post Process table."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._columns: list[tuple[str, np.ndarray]] = []
+
+    def set_columns(self, columns: list[tuple[str, np.ndarray]]) -> None:
+        self.beginResetModel()
+        self._columns = [
+            (header, np.asarray(values, dtype=np.float64)) for header, values in columns
+        ]
+        self.endResetModel()
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008
+        if parent.isValid():
+            return 0
+        return max((values.size for _header, values in self._columns), default=0)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008
+        if parent.isValid():
+            return 0
+        return len(self._columns)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if role != Qt.ItemDataRole.DisplayRole:
+            return None
+        if orientation == Qt.Orientation.Horizontal:
+            if 0 <= section < len(self._columns):
+                return self._columns[section][0]
+            return None
+        return str(section + 1)
+
+    def data(self, index: QModelIndex, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return None
+        _header, values = self._columns[index.column()]
+        row = index.row()
+        if row >= values.size:
+            return ""
+        value = float(values[row])
+        if not math.isfinite(value):
+            return "N/A"
+        return f"{value:.6f}"
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        if not index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+
+    def export_rows(self) -> tuple[list[str], list[list[str]]]:
+        headers = [header for header, _values in self._columns]
+        rows = [
+            [
+                self.data(self.index(row, column)) or ""
+                for column in range(len(self._columns))
+            ]
+            for row in range(self.rowCount())
+        ]
+        return headers, rows
+
+
+class NdNkWindow(QDialog):
+    """Nd and Nk window (non-modal). See the block comment above."""
+
+    _NEEDS_COLOR = "#f0c674"
+    _READY_COLOR = "#5dcaa5"
+
+    def __init__(self, main_window: "SpectrometerApp") -> None:
+        super().__init__(
+            main_window,
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint,
+        )
+        self._main = main_window
+        self.setWindowTitle("Nd and Nk")
+        self.setModal(False)
+        self.resize(1300, 820)
+        self.setStyleSheet(_ND_NK_STYLE)
+
+        # Inputs (kept until replaced).
+        self.si_wavelength: Optional[np.ndarray] = None
+        self.si_n: Optional[np.ndarray] = None
+        self.si_k: Optional[np.ndarray] = None
+        self._si_source = ""
+        # Calculated results (cleared when measurements change). Keys:
+        #   window, grid, si_n, si_k, si_r_<mode>, rel_<mode>, abs_<mode>,
+        #   avg_<mode>_<slot> (detector axis), interp_<mode>_<slot> (grid)
+        self.results: Optional[dict[str, object]] = None
+        # The measurement arrays the results were calculated from.
+        self._results_inputs: Optional[tuple[Optional[np.ndarray], ...]] = None
+        self._results_settings = ""
+        # The measurement arrays currently shown in the table.
+        self._shown_inputs: Optional[tuple[Optional[np.ndarray], ...]] = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        header = QHBoxLayout()
+        self._summary = QLabel("")
+        self._summary.setWordWrap(True)
+        header.addWidget(self._summary, stretch=1)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("accentBtn")
+        close_btn.setAutoDefault(False)
+        close_btn.setDefault(False)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.close)
+        header.addWidget(close_btn)
+        root.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addWidget(self._build_sidebar())
+        body.addWidget(self._build_table_pane(), stretch=1)
+        root.addLayout(body, stretch=1)
+
+        self.sync_measurements()
+        self._refresh_table()
+
+    # ------------------------------------------------------------------
+    # Layout
+    # ------------------------------------------------------------------
+
+    def _build_sidebar(self) -> QScrollArea:
+        content = QWidget()
+        content.setMinimumWidth(300)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(self._build_measurements_group())
+        layout.addWidget(self._build_silicon_group())
+        layout.addWidget(self._build_reflectance_group())
+        layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        scroll.setFixedWidth(330)
+        return scroll
+
+    @staticmethod
+    def _note(text: str = "") -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("ndNkNote")
+        label.setWordWrap(True)
+        return label
+
+    def _footnote(self) -> QLabel:
+        """Live note under a button: what is still needed, or that it is ready."""
+        label = QLabel("")
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        return label
+
+    def _set_footnote(self, label: QLabel, needed: list[str], ready_text: str) -> None:
+        if needed:
+            items = "".join(f"<br>&nbsp;• {item}" for item in needed)
+            label.setText(
+                f"<span style='color:{self._NEEDS_COLOR}'>Still needed:{items}</span>"
+            )
+        else:
+            label.setText(f"<span style='color:{self._READY_COLOR}'>{ready_text}</span>")
+
+    @staticmethod
+    def _grid_edit(default: float, placeholder: str) -> QLineEdit:
+        edit = QLineEdit(f"{default:.3f}")
+        edit.setPlaceholderText(placeholder)
+        validator = QDoubleValidator(0.0, 5000.0, 3, edit)
+        validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        validator.setLocale(QLocale.c())
+        edit.setValidator(validator)
+        return edit
+
+    def _build_measurements_group(self) -> QGroupBox:
+        group = QGroupBox("1 · Measurements")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
+        self._measurement_labels: dict[str, QLabel] = {}
+        for mode, _angle in _ND_NK_MODES:
+            label = QLabel("")
+            label.setTextFormat(Qt.TextFormat.RichText)
+            self._measurement_labels[mode] = label
+            layout.addWidget(label)
+        self._measurement_footnote = self._footnote()
+        layout.addWidget(self._measurement_footnote)
+        layout.addWidget(
+            self._note(
+                "Taken from the main window's captures. Capturing or importing "
+                "new R₀ or R₆₀ data clears the calculations below."
+            )
+        )
+        return group
+
+    def _build_silicon_group(self) -> QGroupBox:
+        group = QGroupBox("2 · Silicon reference")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+        self._import_si_btn = QPushButton("Import Si Values")
+        self._import_si_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_si_btn.clicked.connect(self._import_si_values)
+        layout.addWidget(self._import_si_btn)
+        self._si_footnote = self._footnote()
+        layout.addWidget(self._si_footnote)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        self._si_start_edit = self._grid_edit(350.0, "Start wavelength")
+        self._si_end_edit = self._grid_edit(1000.0, "End wavelength")
+        self._si_step_edit = self._grid_edit(1.0, "Step size")
+        self._si_method_combo = QComboBox()
+        self._si_method_combo.addItems(["Linear", "Cubic", "Nearest"])
+        form.addRow("Start (nm)", self._si_start_edit)
+        form.addRow("End (nm)", self._si_end_edit)
+        form.addRow("Step (nm)", self._si_step_edit)
+        form.addRow("Si method", self._si_method_combo)
+        layout.addLayout(form)
+        for edit in (self._si_start_edit, self._si_end_edit, self._si_step_edit):
+            edit.textChanged.connect(self._update_footnotes)
+        self._grid_footnote = self._footnote()
+        layout.addWidget(self._grid_footnote)
+        return group
+
+    def _build_reflectance_group(self) -> QGroupBox:
+        group = QGroupBox("3 · Absolute reflectance")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+        form = QFormLayout()
+        form.setSpacing(8)
+        self._window_spin = QSpinBox()
+        self._window_spin.setRange(2, 50)
+        self._window_spin.setValue(5)
+        self._window_spin.setSuffix(" points")
+        self._window_spin.valueChanged.connect(self._update_footnotes)
+        self._refl_method_combo = QComboBox()
+        self._refl_method_combo.addItems(["Linear", "Cubic Spline"])
+        form.addRow("Averaging window", self._window_spin)
+        form.addRow("Resampling", self._refl_method_combo)
+        layout.addLayout(form)
+
+        self._calculate_btn = QPushButton("Calculate Reflectance")
+        self._calculate_btn.setObjectName("accentBtn")
+        self._calculate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._calculate_btn.clicked.connect(self._on_calculate_clicked)
+        layout.addWidget(self._calculate_btn)
+        self._calc_footnote = self._footnote()
+        layout.addWidget(self._calc_footnote)
+        layout.addWidget(
+            self._note(
+                "For R₀ and R₆₀: averages each trace, resamples the averages onto "
+                "the Si grid, calculates relative reflectance "
+                "(Sample − Baseline) / (Standard − Baseline), then multiplies by "
+                "the bare-Si reflectance at the same angle."
+            )
+        )
+        return group
+
+    def _build_table_pane(self) -> QWidget:
+        pane = QWidget()
+        layout = QVBoxLayout(pane)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        self._model = _NdNkTableModel(self)
+        self._table = QTableView()
+        self._table.setModel(self._model)
+        self._table.setAlternatingRowColors(True)
+        self._table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self._table.setWordWrap(False)
+        self._table.verticalHeader().setDefaultSectionSize(22)
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        layout.addWidget(self._table, stretch=1)
+
+        bar = QHBoxLayout()
+        self._export_footnote = self._footnote()
+        bar.addWidget(self._export_footnote, stretch=1)
+        self._export_btn = QPushButton("Export CSV")
+        self._export_btn.setObjectName("accentBtn")
+        self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._export_btn.clicked.connect(self._export_csv)
+        bar.addWidget(self._export_btn)
+        layout.addLayout(bar)
+        return pane
+
+    # ------------------------------------------------------------------
+    # Requirements (footnotes and pop-ups)
+    # ------------------------------------------------------------------
+
+    def _missing_measurements(self) -> list[str]:
+        return [
+            f"{_display_mode(mode)} {slot}"
+            for mode, _angle in _ND_NK_MODES
+            for slot in _ND_NK_SLOTS
+            if self._measurement(mode, slot) is None
+        ]
+
+    def _grid_problem(self) -> Optional[str]:
+        try:
+            self._si_grid()
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    def _calculation_requirements(self) -> list[str]:
+        """Everything Calculate Reflectance still needs, in plain words."""
+        needed = []
+        missing = self._missing_measurements()
+        if missing:
+            needed.append(
+                "Measurements: " + ", ".join(missing)
+                + " (capture in the main window, or Import CSV Data)"
+            )
+        elif self._axis() is None:
+            needed.append("A wavelength axis (capture or import a trace)")
+        if self.si_wavelength is None:
+            needed.append("Si values (step 2: Import Si Values)")
+        problem = self._grid_problem()
+        if problem:
+            needed.append(f"A valid wavelength grid (step 2): {problem}")
+        if not missing:
+            sizes = [
+                np.asarray(self._measurement(mode, slot)).size
+                for mode, _angle in _ND_NK_MODES
+                for slot in _ND_NK_SLOTS
+            ]
+            if sizes and self._window_spin.value() > min(sizes):
+                needed.append(
+                    f"An averaging window no longer than the traces ({min(sizes)} points)"
+                )
+        return needed
+
+    def _update_footnotes(self, *_args: object) -> None:
+        missing = self._missing_measurements()
+        self._set_footnote(
+            self._measurement_footnote,
+            [f"{name} (capture in the main window, or Import CSV Data)" for name in missing],
+            "All six traces are available.",
+        )
+        if self.si_wavelength is None:
+            self._set_footnote(
+                self._si_footnote,
+                ["Si values: click Import Si Values (an Excel or CSV file with wavelength, n and k)"],
+                "",
+            )
+        else:
+            self._set_footnote(
+                self._si_footnote,
+                [],
+                f"{self.si_wavelength.size} Si points from {self._si_source} "
+                f"({np.nanmin(self.si_wavelength):.1f}–{np.nanmax(self.si_wavelength):.1f} nm).",
+            )
+        problem = self._grid_problem()
+        if problem:
+            self._set_footnote(self._grid_footnote, [f"A valid grid: {problem}"], "")
+        else:
+            grid = self._si_grid()
+            self._set_footnote(
+                self._grid_footnote,
+                [],
+                f"Grid: {grid.size} points. All results on the right use this grid.",
+            )
+        self._set_footnote(
+            self._calc_footnote, self._calculation_requirements(), "Ready to calculate."
+        )
+        if self._model.columnCount() == 0:
+            self._set_footnote(
+                self._export_footnote,
+                ["Something to export: capture or import measurements, or import Si values"],
+                "",
+            )
+        else:
+            self._export_footnote.setText("")
+
+    def _show_requirements_popup(self, title: str, needed: list[str]) -> None:
+        QMessageBox.information(
+            self,
+            title,
+            "This step needs:\n\n" + "\n".join(f"  •  {item}" for item in needed),
+        )
+
+    # ------------------------------------------------------------------
+    # Measurements (always read live from the main window)
+    # ------------------------------------------------------------------
+
+    def _measurement(self, mode: str, slot: str) -> Optional[np.ndarray]:
+        return self._main.spectra_data.get(mode, {}).get(slot)
+
+    def _measurement_inputs(self) -> tuple[Optional[np.ndarray], ...]:
+        return tuple(
+            self._measurement(mode, slot)
+            for mode, _angle in _ND_NK_MODES
+            for slot in _ND_NK_SLOTS
+        )
+
+    def _axis(self) -> Optional[np.ndarray]:
+        axis = self._main._wavelengths
+        if axis is None:
+            axis = self._main._latest_wavelengths
+        return None if axis is None else np.asarray(axis, dtype=np.float64)
+
+    def sync_measurements(self) -> None:
+        """Update the measurement status and table; clear results if R0/R60 changed.
+
+        Called whenever the main window refreshes its status bar, which it
+        does after every capture, import and reset.
+        """
+        for mode, _angle in _ND_NK_MODES:
+            parts = []
+            for slot in _ND_NK_SLOTS:
+                present = self._measurement(mode, slot) is not None
+                mark = "✓" if present else "–"
+                color = self._READY_COLOR if present else "#6d7480"
+                parts.append(f"{slot} <span style='color:{color}'>{mark}</span>")
+            self._measurement_labels[mode].setText(
+                f"<b>{_display_mode(mode)}</b>: " + "&nbsp;&nbsp;".join(parts)
+            )
+
+        current = self._measurement_inputs()
+        if self._results_inputs is not None:
+            changed = [
+                f"{_display_mode(mode)} {slot}"
+                for (mode, slot), old, new in zip(
+                    (
+                        (mode, slot)
+                        for mode, _angle in _ND_NK_MODES
+                        for slot in _ND_NK_SLOTS
+                    ),
+                    self._results_inputs,
+                    current,
+                )
+                if old is not new
+            ]
+            if changed:
+                self._clear_results(
+                    "Measurements changed (" + ", ".join(changed) + ") — "
+                    "calculations cleared. Press Calculate Reflectance again."
+                )
+                return
+        if self._shown_inputs is None or any(
+            old is not new for old, new in zip(self._shown_inputs, current)
+        ):
+            self._refresh_table()
+        else:
+            self._update_footnotes()
+
+    def _clear_results(self, message: str) -> None:
+        self.results = None
+        self._results_inputs = None
+        self._results_settings = ""
+        self._refresh_table()
+        self._summary.setText(message)
+
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().showEvent(event)
+        self._load_si_from_post_process_if_empty()
+        self.sync_measurements()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        # Only hide: the main window keeps this window, so nothing is lost.
+        event.accept()
+
+    # ------------------------------------------------------------------
+    # Silicon reference
+    # ------------------------------------------------------------------
+
+    def _set_si_values(
+        self, wavelengths: np.ndarray, n_values: np.ndarray, k_values: np.ndarray, source: str
+    ) -> None:
+        self.si_wavelength = np.asarray(wavelengths, dtype=np.float64).copy()
+        self.si_n = np.asarray(n_values, dtype=np.float64).copy()
+        self.si_k = np.asarray(k_values, dtype=np.float64).copy()
+        self._si_source = source
+
+    def _load_si_from_post_process_if_empty(self) -> None:
+        """Reuse Si values imported in Post Process if this window has none."""
+        if self.si_wavelength is not None:
+            return
+        wavelengths = getattr(self._main, "si_wavelength", None)
+        n_values = getattr(self._main, "si_n", None)
+        k_values = getattr(self._main, "si_k", None)
+        if wavelengths is None or n_values is None or k_values is None:
+            return
+        self._set_si_values(wavelengths, n_values, k_values, "Post Process")
+        self._refresh_table()
+
+    def _import_si_values(self) -> None:
+        path_str, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Import Si Values",
+            str(Path.home()),
+            "Excel/CSV Files (*.xlsx *.xls *.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+        try:
+            wavelengths, n_values, k_values = parse_silicon_reference(Path(path_str))
+        except MeasurementCsvError as exc:
+            QMessageBox.warning(self, "Import Failed", str(exc))
+            return
+        self._set_si_values(wavelengths, n_values, k_values, Path(path_str).name)
+        if self.results is not None:
+            self._clear_results(
+                "New Si values imported — calculations cleared. "
+                "Press Calculate Reflectance again."
+            )
+        else:
+            self._refresh_table()
+            self._summary.setText(
+                f"Loaded {wavelengths.size} Si reference points from {Path(path_str).name}."
+            )
+
+    def _si_grid(self) -> np.ndarray:
+        """Wavelength grid from the Silicon reference fields."""
+        values = []
+        for edit, name in (
+            (self._si_start_edit, "Start"),
+            (self._si_end_edit, "End"),
+            (self._si_step_edit, "Step"),
+        ):
+            text = edit.text().strip().replace(",", ".")
+            try:
+                value = float(text)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a number.") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number.")
+            values.append(value)
+        start, end, step = values
+        if step <= 0:
+            raise ValueError("Step must be positive.")
+        if end < start:
+            raise ValueError("End must be greater than or equal to Start.")
+        grid = np.arange(start, end + step / 2.0, step, dtype=np.float64)
+        if grid.size < 2:
+            raise ValueError("The wavelength grid needs at least two points.")
+        return grid
+
+    # ------------------------------------------------------------------
+    # Absolute reflectance
+    # ------------------------------------------------------------------
+
+    def _on_calculate_clicked(self) -> None:
+        needed = self._calculation_requirements()
+        if needed:
+            self._show_requirements_popup("Can't Calculate Yet", needed)
+            return
+        self._run_with_progress("Calculating absolute reflectance", self._calculate_reflectance)
+
+    def _run_with_progress(self, title: str, action: Callable[[], object]) -> None:
+        before = self.results
+        popup = ProgressPopup(title, parent=self)
+        try:
+            popup.run_handler(action, lambda: self.results is not before)
+        finally:
+            popup.deleteLater()
+
+    def _calculate_reflectance(self) -> bool:
+        needed = self._calculation_requirements()
+        if needed:
+            self._show_requirements_popup("Can't Calculate Yet", needed)
+            return False
+        axis = self._axis()
+        grid = self._si_grid()
+        window = int(self._window_spin.value())
+        si_method = self._si_method_combo.currentText()
+        refl_method = self._refl_method_combo.currentText()
+
+        inputs = self._measurement_inputs()
+        try:
+            si_n = _interpolate_si_series(self.si_wavelength, self.si_n, grid, si_method)
+            si_k = _interpolate_si_series(self.si_wavelength, self.si_k, grid, si_method)
+            results: dict[str, object] = {
+                "window": window,
+                "grid": grid,
+                "si_n": si_n,
+                "si_k": si_k,
+            }
+            for mode, angle in _ND_NK_MODES:
+                resampled = {}
+                for slot in _ND_NK_SLOTS:
+                    trace = np.asarray(self._measurement(mode, slot), dtype=np.float64)
+                    if trace.shape != axis.shape:
+                        raise ValueError(
+                            f"{_display_mode(mode)} {slot} has {trace.size} points but the "
+                            f"wavelength axis has {axis.size}."
+                        )
+                    # 1. Average (same function as the Original tab's Average).
+                    averaged = _moving_average_centered(trace, window)
+                    # 2. Resample the average onto the grid (same function as the
+                    #    Original tab's Interpolation; NaN outside the measured range).
+                    resampled[slot] = _interpolate_series(axis, averaged, grid, refl_method)
+                    results[f"avg_{mode}_{slot}"] = averaged
+                    results[f"interp_{mode}_{slot}"] = resampled[slot]
+                # 3. Relative reflectance on the grid (same function as the
+                #    Original tab's Relative Reflectance).
+                relative = _reflectance_ratio(
+                    resampled[CaptureMode.SAMPLE.value],
+                    resampled[CaptureMode.BASELINE.value],
+                    resampled[CaptureMode.STANDARD.value],
+                )
+                # 4. Absolute reflectance = relative x bare-Si reflectance.
+                si_r = thin_film.bare_substrate_reflectance_s(si_n, si_k, angle)
+                results[f"si_r_{mode}"] = si_r
+                results[f"rel_{mode}"] = relative
+                results[f"abs_{mode}"] = relative * si_r
+        except ValueError as exc:
+            QMessageBox.warning(self, "Calculation Failed", str(exc))
+            return False
+        except Exception as exc:
+            logger.exception("Nd and Nk reflectance calculation failed")
+            QMessageBox.critical(self, "Calculation Failed", str(exc))
+            return False
+
+        self.results = results
+        self._results_inputs = inputs
+        self._results_settings = (
+            f"grid {grid[0]:.3f}–{grid[-1]:.3f} nm, step {grid[1] - grid[0]:.3f} nm, "
+            f"Si {si_method}, averaging {window} points, resampling {refl_method}"
+        )
+        self._refresh_table()
+        finite = np.isfinite(results["abs_R0"]) & np.isfinite(results["abs_R60"])
+        self._summary.setText(
+            f"Absolute reflectance calculated on {grid.size} points "
+            f"({int(finite.sum())} with both R₀ and R₆₀ inside the measured range)  ·  "
+            f"{self._results_settings}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Table and export
+    # ------------------------------------------------------------------
+
+    def _refresh_table(self) -> None:
+        """Columns, left to right, in calculation order:
+        measurements | averages | grid: resampled averages, relative,
+        Si n / k / reflectance, absolute | imported Si values."""
+        columns: list[tuple[str, np.ndarray]] = []
+        axis = self._axis()
+        present = [
+            (mode, slot)
+            for mode, _angle in _ND_NK_MODES
+            for slot in _ND_NK_SLOTS
+            if self._measurement(mode, slot) is not None
+        ]
+        r = self.results
+        if axis is not None and present:
+            columns.append(("Wavelength (nm)", axis))
+            for mode, slot in present:
+                columns.append((f"{mode}_{slot} (counts)", self._measurement(mode, slot)))
+            if r is not None:
+                window = r["window"]
+                for mode, slot in present:
+                    columns.append(
+                        (f"{mode}_{slot}_Avg_W{window} (counts)", r[f"avg_{mode}_{slot}"])
+                    )
+        if r is not None:
+            columns.append(("Grid Wavelength (nm)", r["grid"]))
+            for mode, _angle in _ND_NK_MODES:
+                for slot in _ND_NK_SLOTS:
+                    columns.append(
+                        (f"{mode}_{slot}_Interp (counts)", r[f"interp_{mode}_{slot}"])
+                    )
+            columns += [
+                ("R0 Relative", r["rel_R0"]),
+                ("R60 Relative", r["rel_R60"]),
+                ("Si n", r["si_n"]),
+                ("Si k", r["si_k"]),
+                ("Si R0 (0°)", r["si_r_R0"]),
+                ("Si R60 (60°, s-pol)", r["si_r_R60"]),
+                ("R0 Absolute", r["abs_R0"]),
+                ("R60 Absolute", r["abs_R60"]),
+            ]
+        if self.si_wavelength is not None:
+            columns += [
+                ("Imported Si Wavelength (nm)", self.si_wavelength),
+                ("Imported Si n", self.si_n),
+                ("Imported Si k", self.si_k),
+            ]
+        self._model.set_columns(columns)
+        self._shown_inputs = self._measurement_inputs()
+        if r is None:
+            self._summary.setText(
+                "Measurements come from the main window. Import Si values, then press "
+                "Calculate Reflectance."
+            )
+        self._update_footnotes()
+
+    def _export_csv(self) -> None:
+        headers, rows = self._model.export_rows()
+        if not headers:
+            self._show_requirements_popup(
+                "Nothing to Export",
+                ["Measurements in the main window, or imported Si values"],
+            )
+            return
+        default_name = f"nd_nk_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path_str, _selected = QFileDialog.getSaveFileName(
+            self,
+            "Export Nd and Nk Table",
+            str(Path.home() / default_name),
+            "CSV Files (*.csv);;All Files (*)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+        try:
+            with path.open("w", newline="", encoding="utf-8-sig") as handle:
+                handle.write("sep=,\n")
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export Failed", str(exc))
+            return
+        QMessageBox.information(
+            self, "Export Complete", f"Saved {len(rows)} rows to:\n{path}"
+        )
+
+
+class SpectrometerAppWithNdNk(SpectrometerApp):
+    """Main window plus an "Nd and Nk" button at the right end of the top row.
+
+    The button goes in the top row (which has plenty of free space) rather than
+    the bottom row, so the main window's minimum width is unchanged.
+    """
+
+    # Created the first time the button is pressed, then kept (remembering).
+    _nd_nk_window: Optional[NdNkWindow] = None
+
+    def _build_geometry_row(self) -> QHBoxLayout:
+        row = super()._build_geometry_row()
+        self._nd_nk_btn = QPushButton("Nd and Nk")
+        self._nd_nk_btn.setObjectName("actionBtn")
+        self._nd_nk_btn.setMinimumWidth(130)
+        self._nd_nk_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._nd_nk_btn.setToolTip(
+            "Open the Nd and Nk window: silicon reference, absolute reflectance "
+            "and thin-film fits using R₀ and R₆₀"
+        )
+        self._nd_nk_btn.clicked.connect(self._open_nd_nk_window)
+        row.addWidget(self._nd_nk_btn)
+        return row
+
+    def _open_nd_nk_window(self) -> None:
+        if self._nd_nk_window is None:
+            self._nd_nk_window = NdNkWindow(self)
+        window = self._nd_nk_window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _refresh_status(self) -> None:
+        super()._refresh_status()
+        # The main window refreshes its status after every capture, import
+        # and reset, so this keeps the Nd and Nk window in step with the data.
+        if self._nd_nk_window is not None:
+            self._nd_nk_window.sync_measurements()
+
+
+# ===========================================================================
+# END OF ADDED FEATURE: Nd and Nk window
+# ===========================================================================
+
+
 def main() -> int:
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -4310,7 +4889,7 @@ def main() -> int:
     font = QFont("Segoe UI", 10)
     app.setFont(font)
 
-    window = SpectrometerApp()
+    window = SpectrometerAppWithNdNk()
     window.show()
     return app.exec()
 
