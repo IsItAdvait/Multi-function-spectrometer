@@ -4031,6 +4031,8 @@ class SpectrometerApp(QMainWindow):
 
 import thin_film  # noqa: E402
 from PyQt6.QtWidgets import QCheckBox, QGridLayout, QTabWidget  # noqa: E402
+import zipfile as _zipfile  # noqa: E402
+from xml.sax.saxutils import escape as _xml_escape  # noqa: E402
 
 # Optical modes used by the Nd and Nk fits, with the angle each one measures.
 _ND_NK_MODES: tuple[tuple[str, float], ...] = (("R0", 0.0), ("R60", 60.0))
@@ -4208,6 +4210,315 @@ class _NdNkTableModel(QAbstractTableModel):
             for row in range(self.rowCount())
         ]
         return headers, rows
+
+
+# ---------------------------------------------------------------------------
+# Excel export: one .xlsx with the table, the graph (a real Excel chart linked
+# to the table's columns) and the settings / fit results. Written with the
+# standard library only (zip + XML), so it needs no extra package in the .exe.
+# ---------------------------------------------------------------------------
+
+_XLSX_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_XLSX_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_XLSX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_XLSX_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_XLSX_C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+_XLSX_XDR_NS = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+
+
+def _xlsx_column_name(index: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA, ..."""
+    name = ""
+    index += 1
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def _xlsx_text(value: object) -> str:
+    text = "".join(ch for ch in str(value) if ch in "\t\n" or ord(ch) >= 32)
+    return _xml_escape(text)
+
+
+def _xlsx_cell(reference: str, value: object, bold: bool = False) -> str:
+    """One cell: a number (NaN / missing -> no cell, i.e. blank) or text."""
+    style = ' s="1"' if bold else ""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        if not math.isfinite(number):
+            return ""
+        return f'<c r="{reference}"{style}><v>{number!r}</v></c>'
+    return (
+        f'<c r="{reference}"{style} t="inlineStr"><is><t xml:space="preserve">'
+        f"{_xlsx_text(value)}</t></is></c>"
+    )
+
+
+def _xlsx_sheet(
+    rows: list[str], widths: list[float], freeze_header: bool, drawing: bool = False
+) -> str:
+    view = (
+        '<sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" '
+        'activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft"/>'
+        "</sheetView>"
+        if freeze_header
+        else '<sheetView workbookViewId="0"/>'
+    )
+    cols = "".join(
+        f'<col min="{i + 1}" max="{i + 1}" width="{w:.1f}" customWidth="1"/>'
+        for i, w in enumerate(widths)
+    )
+    return (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet xmlns="{_XLSX_NS}" xmlns:r="{_XLSX_REL_NS}">'
+        f"<sheetViews>{view}</sheetViews>"
+        '<sheetFormatPr defaultRowHeight="15"/>'
+        + (f"<cols>{cols}</cols>" if cols else "")
+        + "<sheetData>" + "".join(rows) + "</sheetData>"
+        + ('<drawing r:id="rId1"/>' if drawing else "")
+        + "</worksheet>"
+    )
+
+
+def _xlsx_rich_title(text: str, size: int = 1200) -> str:
+    return (
+        f'<c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="{size}" b="1"/>'
+        f'</a:pPr><a:r><a:rPr lang="en-US" sz="{size}" b="1"/><a:t>{_xlsx_text(text)}</a:t></a:r>'
+        '</a:p></c:rich></c:tx><c:overlay val="0"/></c:title>'
+    )
+
+
+def _xlsx_num_ref(formula: str, values: np.ndarray) -> str:
+    points = "".join(
+        f'<c:pt idx="{i}"><c:v>{float(v)!r}</c:v></c:pt>'
+        for i, v in enumerate(values)
+        if math.isfinite(float(v))
+    )
+    return (
+        f"<c:numRef><c:f>{_xlsx_text(formula)}</c:f><c:numCache><c:formatCode>General"
+        f'</c:formatCode><c:ptCount val="{len(values)}"/>{points}</c:numCache></c:numRef>'
+    )
+
+
+def _xlsx_chart(chart: dict[str, object]) -> str:
+    """A scatter chart with straight lines: one series per curve."""
+    series_xml = []
+    for index, series in enumerate(chart["series"]):
+        dash = '<a:prstDash val="dash"/>' if series["dashed"] else ""
+        series_xml.append(
+            f'<c:ser><c:idx val="{index}"/><c:order val="{index}"/>'
+            f"<c:tx><c:v>{_xlsx_text(series['name'])}</c:v></c:tx>"
+            f'<c:spPr><a:ln w="19050" cap="rnd"><a:solidFill><a:srgbClr val="{series["color"]}"/>'
+            f"</a:solidFill>{dash}<a:round/></a:ln></c:spPr>"
+            '<c:marker><c:symbol val="none"/></c:marker>'
+            f"<c:xVal>{_xlsx_num_ref(series['x_ref'], series['x'])}</c:xVal>"
+            f"<c:yVal>{_xlsx_num_ref(series['y_ref'], series['y'])}</c:yVal>"
+            '<c:smooth val="0"/></c:ser>'
+        )
+
+    def axis(ax_id: int, cross_id: int, position: str, title: str, limits: str) -> str:
+        return (
+            f'<c:valAx><c:axId val="{ax_id}"/><c:scaling><c:orientation val="minMax"/>{limits}'
+            f'</c:scaling><c:delete val="0"/><c:axPos val="{position}"/><c:majorGridlines>'
+            '<c:spPr><a:ln w="6350"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln>'
+            f"</c:spPr></c:majorGridlines>{_xlsx_rich_title(title, 1000)}"
+            '<c:numFmt formatCode="General" sourceLinked="0"/><c:majorTickMark val="out"/>'
+            '<c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>'
+            f'<c:crossAx val="{cross_id}"/><c:crosses val="autoZero"/>'
+            '<c:crossBetween val="midCat"/></c:valAx>'
+        )
+
+    x_limits = f'<c:max val="{chart["x_max"]!r}"/><c:min val="{chart["x_min"]!r}"/>'
+    return (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<c:chartSpace xmlns:c="{_XLSX_C_NS}" xmlns:a="{_XLSX_A_NS}" xmlns:r="{_XLSX_REL_NS}">'
+        '<c:roundedCorners val="0"/><c:chart>'
+        f'{_xlsx_rich_title(chart["title"], 1100)}<c:autoTitleDeleted val="0"/><c:plotArea>'
+        '<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/>'
+        '<c:yMode val="edge"/><c:x val="0.1"/><c:y val="0.12"/><c:w val="0.56"/>'
+        '<c:h val="0.7"/></c:manualLayout></c:layout>'
+        '<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>'
+        + "".join(series_xml)
+        + '<c:axId val="500000001"/><c:axId val="500000002"/></c:scatterChart>'
+        + axis(500000001, 500000002, "b", chart["x_title"], x_limits)
+        + axis(500000002, 500000001, "l", chart["y_title"], "")
+        + '</c:plotArea><c:legend><c:legendPos val="r"/><c:layout><c:manualLayout>'
+        '<c:xMode val="edge"/><c:yMode val="edge"/><c:x val="0.69"/><c:y val="0.12"/>'
+        '<c:w val="0.3"/><c:h val="0.3"/></c:manualLayout></c:layout><c:overlay val="0"/>'
+        '<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900"/></a:pPr>'
+        '<a:endParaRPr lang="en-US"/></a:p></c:txPr></c:legend>'
+        '<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>'
+    )
+
+
+def _write_results_workbook(
+    path: Path,
+    data_columns: list[tuple[str, np.ndarray]],
+    chart: Optional[dict[str, object]],
+    info_rows: list[tuple[object, object, bool]],
+) -> None:
+    """Write the .xlsx: sheet "Data" (the table), "Graph" (the chart, if any)
+    and "Settings and fits" (label / value rows; the bool marks bold rows).
+
+    ``chart``: title, x_title, y_title, x_min, x_max and series (name, x_column,
+    y_column = indexes into data_columns, length = number of points, color,
+    dashed). The chart's series point at the Data sheet, so it follows edits.
+    """
+    # Data sheet
+    headers = [header for header, _values in data_columns]
+    arrays = [np.asarray(values, dtype=np.float64).ravel() for _header, values in data_columns]
+    row_count = max((a.size for a in arrays), default=0)
+    letters = [_xlsx_column_name(i) for i in range(len(arrays))]
+    rows = [
+        '<row r="1">'
+        + "".join(_xlsx_cell(f"{letters[i]}1", h, bold=True) for i, h in enumerate(headers))
+        + "</row>"
+    ]
+    for r in range(row_count):
+        cells = "".join(
+            _xlsx_cell(f"{letters[i]}{r + 2}", a[r]) for i, a in enumerate(arrays) if r < a.size
+        )
+        rows.append(f'<row r="{r + 2}">{cells}</row>')
+    widths = [min(42.0, max(12.0, len(h) * 1.05 + 2)) for h in headers]
+    sheets = [("Data", _xlsx_sheet(rows, widths, freeze_header=True))]
+
+    # Graph sheet
+    chart_xml = None
+    if chart is not None:
+        series = []
+        for s in chart["series"]:
+            x_col, y_col, n = s["x_column"], s["y_column"], s["length"]
+            series.append(
+                {
+                    "name": s["name"], "color": s["color"], "dashed": s["dashed"],
+                    "x_ref": f"'Data'!${letters[x_col]}$2:${letters[x_col]}${n + 1}",
+                    "y_ref": f"'Data'!${letters[y_col]}$2:${letters[y_col]}${n + 1}",
+                    "x": arrays[x_col][:n], "y": arrays[y_col][:n],
+                }
+            )
+        chart_xml = _xlsx_chart({**chart, "series": series})
+        note = _xlsx_cell(
+            "A1",
+            "Drawn from the Data sheet: the same curves as the app's Graph tab.",
+        )
+        sheets.append(
+            ("Graph", _xlsx_sheet([f'<row r="1">{note}</row>'], [], False, drawing=True))
+        )
+
+    # Settings and fits sheet
+    info = []
+    for r, (label, value, bold) in enumerate(info_rows, start=1):
+        info.append(
+            f'<row r="{r}">{_xlsx_cell(f"A{r}", label, bold)}{_xlsx_cell(f"B{r}", value, bold)}</row>'
+        )
+    sheets.append(("Settings and fits", _xlsx_sheet(info, [44.0, 60.0], freeze_header=False)))
+
+    # Package parts
+    workbook_sheets = "".join(
+        f'<sheet name="{_xlsx_text(name)}" sheetId="{i + 1}" r:id="rId{i + 1}"/>'
+        for i, (name, _xml) in enumerate(sheets)
+    )
+    workbook_rels = "".join(
+        f'<Relationship Id="rId{i + 1}" Type="{_XLSX_REL_NS}/worksheet" '
+        f'Target="worksheets/sheet{i + 1}.xml"/>'
+        for i in range(len(sheets))
+    ) + (
+        f'<Relationship Id="rId{len(sheets) + 1}" Type="{_XLSX_REL_NS}/styles" '
+        'Target="styles.xml"/>'
+    )
+    overrides = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{i + 1}.xml" ContentType="application/'
+        'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for i in range(len(sheets))
+    )
+    if chart_xml is not None:
+        overrides += (
+            '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/'
+            'vnd.openxmlformats-officedocument.drawing+xml"/>'
+            '<Override PartName="/xl/charts/chart1.xml" ContentType="application/'
+            'vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
+        )
+    header = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    parts = {
+        "[Content_Types].xml": (
+            f'{header}<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.'
+            'relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-'
+            'officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+            '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-'
+            'package.core-properties+xml"/>'
+            f"{overrides}</Types>"
+        ),
+        "_rels/.rels": (
+            f'{header}<Relationships xmlns="{_XLSX_PKG_REL_NS}">'
+            f'<Relationship Id="rId1" Type="{_XLSX_REL_NS}/officeDocument" Target="xl/workbook.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/'
+            'relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>'
+        ),
+        "docProps/core.xml": (
+            f'{header}<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/'
+            'metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/'
+            'XMLSchema-instance"><dc:title>Nd and Nk results</dc:title><dc:creator>'
+            'Multi-Function Optical Analyzer</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">'
+            f'{datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")}</dcterms:created></cp:coreProperties>'
+        ),
+        "xl/workbook.xml": (
+            f'{header}<workbook xmlns="{_XLSX_NS}" xmlns:r="{_XLSX_REL_NS}">'
+            f"<bookViews><workbookView/></bookViews><sheets>{workbook_sheets}</sheets></workbook>"
+        ),
+        "xl/_rels/workbook.xml.rels": (
+            f'{header}<Relationships xmlns="{_XLSX_PKG_REL_NS}">{workbook_rels}</Relationships>'
+        ),
+        "xl/styles.xml": (
+            f'{header}<styleSheet xmlns="{_XLSX_NS}"><fonts count="2"><font><sz val="11"/>'
+            '<name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font>'
+            '</fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill>'
+            '<patternFill patternType="gray125"/></fill></fills><borders count="1"><border>'
+            '<left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1">'
+            '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+            '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+            '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+            '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/>'
+            "</cellStyles></styleSheet>"
+        ),
+    }
+    for i, (_name, xml) in enumerate(sheets):
+        parts[f"xl/worksheets/sheet{i + 1}.xml"] = xml
+    if chart_xml is not None:
+        graph_index = [name for name, _xml in sheets].index("Graph") + 1
+        parts[f"xl/worksheets/_rels/sheet{graph_index}.xml.rels"] = (
+            f'{header}<Relationships xmlns="{_XLSX_PKG_REL_NS}"><Relationship Id="rId1" '
+            f'Type="{_XLSX_REL_NS}/drawing" Target="../drawings/drawing1.xml"/></Relationships>'
+        )
+        parts["xl/drawings/drawing1.xml"] = (
+            f'{header}<xdr:wsDr xmlns:xdr="{_XLSX_XDR_NS}" xmlns:a="{_XLSX_A_NS}">'
+            # 6.3 x 4.3 inches from cell A3: fits a printed A4 or Letter page.
+            '<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff>'
+            '<xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
+            '<xdr:ext cx="5760720" cy="3931920"/><xdr:graphicFrame macro="">'
+            '<xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Reflectance chart"/>'
+            '<xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/>'
+            '<a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.'
+            f'openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="{_XLSX_C_NS}" '
+            f'xmlns:r="{_XLSX_REL_NS}" r:id="rId1"/></a:graphicData></a:graphic>'
+            "</xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"
+        )
+        parts["xl/drawings/_rels/drawing1.xml.rels"] = (
+            f'{header}<Relationships xmlns="{_XLSX_PKG_REL_NS}"><Relationship Id="rId1" '
+            f'Type="{_XLSX_REL_NS}/chart" Target="../charts/chart1.xml"/></Relationships>'
+        )
+        parts["xl/charts/chart1.xml"] = chart_xml
+    temp = path.with_name(path.name + ".part")
+    with _zipfile.ZipFile(temp, "w", _zipfile.ZIP_DEFLATED) as archive:
+        for name, xml in parts.items():
+            archive.writestr(name, xml.encode("utf-8"))
+    temp.replace(path)  # only replace an existing file once the new one is complete
 
 
 class NdNkWindow(QDialog):
@@ -4596,9 +4907,13 @@ class NdNkWindow(QDialog):
         bar = QHBoxLayout()
         self._export_footnote = self._footnote()
         bar.addWidget(self._export_footnote, stretch=1)
-        self._export_btn = QPushButton("Export CSV")
+        self._export_btn = QPushButton("Export (Excel or CSV)")
         self._export_btn.setObjectName("accentBtn")
         self._export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._export_btn.setToolTip(
+            "Excel: one file with the table, the graph and the settings / fit "
+            "results. CSV: the table only (a CSV file cannot hold a graph)."
+        )
         self._export_btn.clicked.connect(self._export_csv)
         bar.addWidget(self._export_btn)
         layout.addLayout(bar)
@@ -4632,6 +4947,12 @@ class NdNkWindow(QDialog):
         self._save_graph_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._save_graph_btn.clicked.connect(self._save_graph_image)
         graph_bar.addWidget(self._save_graph_btn)
+        self._export_graph_tab_btn = QPushButton("Export (Excel or CSV)")
+        self._export_graph_tab_btn.setObjectName("accentBtn")
+        self._export_graph_tab_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._export_graph_tab_btn.setToolTip(self._export_btn.toolTip())
+        self._export_graph_tab_btn.clicked.connect(self._export_csv)
+        graph_bar.addWidget(self._export_graph_tab_btn)
         graph_layout.addLayout(graph_bar)
         self._results_tabs.addTab(graph_page, "Graph")
         return self._results_tabs
@@ -5478,35 +5799,158 @@ class NdNkWindow(QDialog):
         self._update_footnotes()
 
     def _export_csv(self) -> None:
+        """Export the table: Excel (table + graph + settings / fits) or CSV (table)."""
         needed = self._requirements("export")
         if needed:
             self._show_requirements_popup("Nothing to Export", needed)
             return
-        headers, rows = self._model.export_rows()
-        default_name = f"nd_nk_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        path_str, _selected = QFileDialog.getSaveFileName(
+        excel_filter = "Excel workbook: table, graph, settings and fits (*.xlsx)"
+        csv_filter = "CSV file: table only (*.csv)"
+        default_name = f"nd_nk_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path_str, selected = QFileDialog.getSaveFileName(
             self,
-            "Export Nd and Nk Table",
+            "Export Nd and Nk Results",
             str(Path.home() / default_name),
-            "CSV Files (*.csv);;All Files (*)",
+            f"{excel_filter};;{csv_filter}",
         )
         if not path_str:
             return
         path = Path(path_str)
-        if path.suffix.lower() != ".csv":
-            path = path.with_suffix(".csv")
+        suffix = path.suffix.lower()
+        if suffix not in (".xlsx", ".csv"):
+            suffix = ".csv" if selected == csv_filter else ".xlsx"
+            path = path.with_name(path.name + suffix)
         try:
-            with path.open("w", newline="", encoding="utf-8-sig") as handle:
-                handle.write("sep=,\n")
-                writer = csv.writer(handle)
-                writer.writerow(headers)
-                writer.writerows(rows)
+            if suffix == ".csv":
+                headers, rows = self._model.export_rows()
+                with path.open("w", newline="", encoding="utf-8-sig") as handle:
+                    handle.write("sep=,\n")
+                    writer = csv.writer(handle)
+                    writer.writerow(headers)
+                    writer.writerows(rows)
+                message = f"Saved the table ({len(rows)} rows) to:\n{path}"
+            else:
+                columns = list(self._model._columns)
+                chart = self._export_chart_spec(columns)
+                _write_results_workbook(path, columns, chart, self._export_info_rows())
+                message = (
+                    f"Saved to:\n{path}\n\nSheets: Data (the table)"
+                    + (", Graph (chart from the Data sheet)" if chart else "")
+                    + ", Settings and fits."
+                )
         except OSError as exc:
             QMessageBox.critical(self, "Export Failed", str(exc))
             return
-        QMessageBox.information(
-            self, "Export Complete", f"Saved {len(rows)} rows to:\n{path}"
-        )
+        QMessageBox.information(self, "Export Complete", message)
+
+    def _export_chart_spec(
+        self, columns: list[tuple[str, np.ndarray]]
+    ) -> Optional[dict[str, object]]:
+        """The Graph tab's four curves as an Excel chart (needs step 7)."""
+        if self.absolute is None:
+            return None
+        headers = [header for header, _values in columns]
+        names = {
+            "x": "Interp Wavelength (nm)",
+            "R0": "R0 Absolute Reflectance",
+            "R60": "R60 Absolute Reflectance",
+            "si_R0": "Si R0 (0°)",
+            "si_R60": "Si R60 (60°, s-pol)",
+        }
+        if any(name not in headers for name in names.values()):
+            return None
+        grid = np.asarray(self.absolute["grid"])
+        colors = {mode: "%02X%02X%02X" % self._PLOT_COLORS[mode] for mode in ("R0", "R60")}
+        series = []
+        for key, label, mode, dashed in (
+            ("R0", "R₀ absolute (0°)", "R0", False),
+            ("R60", "R₆₀ absolute (60°, s-pol)", "R60", False),
+            ("si_R0", "Si R₀ (0°)", "R0", True),
+            ("si_R60", "Si R₆₀ (60°, s-pol)", "R60", True),
+        ):
+            series.append(
+                {
+                    "name": label, "color": colors[mode], "dashed": dashed,
+                    "x_column": headers.index(names["x"]),
+                    "y_column": headers.index(names[key]),
+                    "length": grid.size,
+                }
+            )
+        return {
+            "title": "Absolute reflectance and bare-Si reflectance vs wavelength",
+            "x_title": "Wavelength (nm)",
+            "y_title": "Reflectance",
+            "x_min": float(grid[0]),
+            "x_max": float(grid[-1]),
+            "series": series,
+        }
+
+    def _export_info_rows(self) -> list[tuple[object, object, bool]]:
+        """Settings and fit results for the "Settings and fits" sheet."""
+        rows: list[tuple[object, object, bool]] = [
+            ("Nd and Nk results", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), True),
+            ("π used", "true π (3.14159265…)", False),
+            ("", "", False),
+            ("Calculation settings", "", True),
+        ]
+        if self.averages:
+            rows.append(("Step 2: averaging window (points)", self.averages["window"], False))
+        if self.relative_interp is not None:
+            grid = np.asarray(self.relative_interp["grid"])
+            rows += [
+                ("Step 4: grid start (nm)", float(grid[0]), False),
+                ("Step 4: grid end (nm)", float(grid[-1]), False),
+                ("Step 4: grid points", int(grid.size), False),
+                ("Step 4: method", self.relative_interp["method"], False),
+            ]
+        if self.si_interp is not None:
+            rows.append(("Step 6: Si interpolation method", self.si_interp["method"], False))
+        if self.absolute is not None:
+            rows.append(
+                (
+                    "Step 7: bare-Si reflectance",
+                    "lab Excel sheet method (each step rounded to 4 decimals), with π",
+                    False,
+                )
+            )
+        fit = self.nd_fit
+        if fit is not None:
+            rows += [
+                ("", "", False),
+                ("Nd fit (step 9)", "", True),
+                ("Wavelength (nm)", fit["wavelength"], False),
+                ("R₀, R₆₀ and Si n₂, k₂", fit.get("source", "from the table"), False),
+                ("n₁ start", fit["n1_start"], False),
+                ("n₁ range (Δn₁)", fit["n1_range"], False),
+                ("k₁", fit["k1"], False),
+                ("d₁ start (nm)", fit["d1_start"], False),
+                ("d₁ range (Δd₁, nm)", fit["d1_range"], False),
+                ("Si n₂", fit["n2"], False),
+                ("Si k₂", fit["k2"], False),
+                ("Result: n₁", fit["n1"], True),
+                ("Result: d₁ (nm)", fit["d1"], True),
+                ("Error (ΔR₆₀² + ΔR₀²)", fit["error"], False),
+                ("R₆₀ measured", fit["r60_measured"], False),
+                ("R₆₀ fitted", fit["r60_fit"], False),
+                ("R₀ measured", fit["r0_measured"], False),
+                ("R₀ fitted", fit["r0_fit"], False),
+            ]
+        nk = self.nk_fit
+        if nk is not None:
+            wavelengths = np.asarray(nk["wavelength"])
+            rows += [
+                ("", "", False),
+                ("Nk fit (step 10)", "", True),
+                ("d₁ (nm)", nk["d1"], False),
+                ("n₁ start", nk["n1_start"], False),
+                ("n₁ range (Δn₁)", nk["n1_range"], False),
+                ("k₁ start", nk["k1_start"], False),
+                ("k₁ range (Δk₁)", nk["k1_range"], False),
+                ("Wavelengths", f"{wavelengths.size} ({wavelengths[0]:g}–{wavelengths[-1]:g} nm)", False),
+                ("Wavelengths fitted", int(np.isfinite(np.asarray(nk["n1"])).sum()), False),
+                ("Results", "Fitted n1 and Fitted k1 columns of the Data sheet", False),
+            ]
+        return rows
 
 
 class NdFitDialog(QDialog):
@@ -6152,25 +6596,26 @@ class NkFitDialog(QDialog):
 class SpectrometerAppWithNdNk(SpectrometerApp):
     """Main window plus an "Nd and Nk" button at the right end of the top row.
 
-    The button goes in the top row (which has plenty of free space) rather than
-    the bottom row, so the main window's minimum width is unchanged.
+    The button sits in the bottom row, right after Post Process (it is added to
+    the row the original code builds; nothing in that code changes).
     """
 
     # Created the first time the button is pressed, then kept (remembering).
     _nd_nk_window: Optional[NdNkWindow] = None
 
-    def _build_geometry_row(self) -> QHBoxLayout:
-        row = super()._build_geometry_row()
+    def _build_controls_row(self) -> QHBoxLayout:
+        row = super()._build_controls_row()
         self._nd_nk_btn = QPushButton("Nd and Nk")
-        self._nd_nk_btn.setObjectName("actionBtn")
-        self._nd_nk_btn.setMinimumWidth(130)
+        self._nd_nk_btn.setObjectName("actionBtn")  # same look as Post Process
+        self._nd_nk_btn.setMinimumHeight(40)  # width: just what its text needs
         self._nd_nk_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._nd_nk_btn.setToolTip(
-            "Open the Nd and Nk window: silicon reference, absolute reflectance "
-            "and thin-film fits using R₀ and R₆₀"
+            "Open the Nd and Nk window: absolute reflectance from R₀ and R₆₀, "
+            "and the Nd and Nk thin-film fits"
         )
         self._nd_nk_btn.clicked.connect(self._open_nd_nk_window)
-        row.addWidget(self._nd_nk_btn)
+        index = row.indexOf(self._post_process_btn)
+        row.insertWidget(index + 1 if index >= 0 else row.count(), self._nd_nk_btn)
         return row
 
     def _open_nd_nk_window(self) -> None:
