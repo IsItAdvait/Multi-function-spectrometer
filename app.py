@@ -4035,7 +4035,15 @@ class SpectrometerApp(QMainWindow):
 # ===========================================================================
 
 import thin_film  # noqa: E402
-from PyQt6.QtWidgets import QCheckBox, QGridLayout, QTabWidget  # noqa: E402
+from PyQt6.QtGui import QColor  # noqa: E402
+from PyQt6.QtWidgets import (  # noqa: E402
+    QCheckBox,
+    QGridLayout,
+    QListWidget,
+    QListWidgetItem,
+    QRadioButton,
+    QTabWidget,
+)
 import zipfile as _zipfile  # noqa: E402
 from xml.sax.saxutils import escape as _xml_escape  # noqa: E402
 
@@ -4137,6 +4145,11 @@ QPushButton#accentBtn {
 }
 QPushButton#accentBtn:hover:!disabled {
     background-color: #16566c;
+}
+QPushButton#accentBtn:disabled {
+    background-color: #1e2229;
+    color: #5c6370;
+    border: 1px solid #2a2f3a;
 }
 QSpinBox, QComboBox, QLineEdit {
     background-color: #1e2229;
@@ -4552,6 +4565,18 @@ def _write_results_workbook(
     temp.replace(path)  # only replace an existing file once the new one is complete
 
 
+def _show_maximized(window: QWidget) -> None:
+    """Open a window maximized (fills the screen it is on, title bar kept).
+
+    A window that is already open on screen keeps the size the user gave it
+    and is just brought to the front.
+    """
+    if not window.isVisible() or window.isMinimized():
+        window.showMaximized()
+    window.raise_()
+    window.activateWindow()
+
+
 class NdNkWindow(QDialog):
     """Nd and Nk window (non-modal). See the block comment above."""
 
@@ -4592,7 +4617,10 @@ class NdNkWindow(QDialog):
         # Step 9: the last Nd fit (thin_film.fit_nd result) and its window.
         self.nd_fit: Optional[dict[str, object]] = None
         self._nd_fit_dialog: Optional["NdFitDialog"] = None
-        # Step 10: the last Nk fit (thin_film.fit_nk_spectrum result + inputs).
+        # Step 10: finished Nk runs not yet stored (each: one wavelength range and
+        # its inputs), and the stored result (runs merged at Finish).
+        self.nk_segments: list[dict[str, object]] = []
+        self.nk_run_counter = 0
         self.nk_fit: Optional[dict[str, object]] = None
         self._nk_fit_dialog: Optional["NkFitDialog"] = None
         # The measurement arrays the results were calculated from.
@@ -5324,14 +5352,17 @@ class NdNkWindow(QDialog):
         self._set_footnote(self._nd_fit_footnote, self._requirements("nd_fit"), fit_text)
         if self._nd_fit_dialog is not None:
             self._nd_fit_dialog.refresh()
+        nk_parts = []
         if self.nk_fit is not None:
             done = int(np.isfinite(self.nk_fit["n1"]).sum())
-            nk_text = (
-                f"Last fit: {done} wavelengths with d₁ = {self.nk_fit['d1']:.4f} nm "
-                "(n₁ and k₁ are in the table)."
+            nk_parts.append(f"Stored: {done} wavelengths (n₁ and k₁ are in the table).")
+        if self.nk_segments:
+            count = len(self.nk_segments)
+            nk_parts.append(
+                f"{count} run{'s' if count != 1 else ''} not stored yet (press Finish "
+                "in the Nk Fit window)."
             )
-        else:
-            nk_text = "Ready. Opens the Nk Fit window."
+        nk_text = " ".join(nk_parts) or "Ready. Opens the Nk Fit window."
         self._set_footnote(self._nk_fit_footnote, self._requirements("nk_fit"), nk_text)
         if self._nk_fit_dialog is not None:
             self._nk_fit_dialog.refresh()
@@ -5442,8 +5473,9 @@ class NdNkWindow(QDialog):
             self.nd_fit = None  # the Nd fit used step 7's values
             if self._nd_fit_dialog is not None:
                 self._nd_fit_dialog.results_cleared(had_fit)
-            had_nk = self.nk_fit is not None
-            self.nk_fit = None  # so did the Nk fit
+            had_nk = self.nk_fit is not None or bool(self.nk_segments)
+            self.nk_fit = None  # so did the Nk runs and their stored result
+            self.nk_segments = []
             if self._nk_fit_dialog is not None:
                 self._nk_fit_dialog.results_cleared(had_nk)
         self.plotted = False
@@ -5843,9 +5875,7 @@ class NdNkWindow(QDialog):
         if self._nd_fit_dialog is None:
             self._nd_fit_dialog = NdFitDialog(self)
         self._nd_fit_dialog.refresh()
-        self._nd_fit_dialog.show()
-        self._nd_fit_dialog.raise_()
-        self._nd_fit_dialog.activateWindow()
+        _show_maximized(self._nd_fit_dialog)
 
     def _open_nk_fit(self) -> None:
         needed = self._requirements("nk_fit")
@@ -5855,9 +5885,7 @@ class NdNkWindow(QDialog):
         if self._nk_fit_dialog is None:
             self._nk_fit_dialog = NkFitDialog(self)
         self._nk_fit_dialog.refresh()
-        self._nk_fit_dialog.show()
-        self._nk_fit_dialog.raise_()
-        self._nk_fit_dialog.activateWindow()
+        _show_maximized(self._nk_fit_dialog)
 
     def nd_fit_values(self, wavelength: float) -> dict[str, object]:
         """R0, R60 (step 7) and Si n2, k2 (step 6) at one wavelength.
@@ -6132,18 +6160,34 @@ class NdNkWindow(QDialog):
         nk = self.nk_fit
         if nk is not None:
             wavelengths = np.asarray(nk["wavelength"])
+            segment_of = np.asarray(nk["segment"])
             rows += [
                 ("", "", False),
                 ("Nk fit (step 10)", "", True),
-                ("d₁ (nm)", nk["d1"], False),
-                ("n₁ start", nk["n1_start"], False),
-                ("n₁ range (Δn₁)", nk["n1_range"], False),
-                ("k₁ start", nk["k1_start"], False),
-                ("k₁ range (Δk₁)", nk["k1_range"], False),
-                ("Wavelengths", f"{wavelengths.size} ({wavelengths[0]:g}–{wavelengths[-1]:g} nm)", False),
+                (
+                    "Stored as",
+                    "Complete (all runs merged)"
+                    if nk["mode"] == "complete"
+                    else "Segments (chosen runs)",
+                    False,
+                ),
+                ("Where runs overlap", "the value with the smaller error is kept", False),
+                ("Wavelengths stored", f"{wavelengths.size} ({wavelengths[0]:g}–{wavelengths[-1]:g} nm)", False),
                 ("Wavelengths fitted", int(np.isfinite(np.asarray(nk["n1"])).sum()), False),
                 ("Results", "Fitted n1 and Fitted k1 columns of the Data sheet", False),
             ]
+            for run in nk["runs"]:
+                used = int((segment_of == run["id"]).sum())
+                rows += [
+                    (
+                        f"Run {run['id']}",
+                        f"{run['start']:g}–{run['end']:g} nm · d₁ {run['d1']:.6f} nm · n₁ "
+                        f"{_plain_number(run['n1_start'])} + {_plain_number(run['n1_range'])} · "
+                        f"k₁ {_plain_number(run['k1_start'])} + {_plain_number(run['k1_range'])} · "
+                        f"{used} stored value{'s' if used != 1 else ''}",
+                        False,
+                    ),
+                ]
         return rows
 
 
@@ -6268,6 +6312,8 @@ class NdFitDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content.setMaximumWidth(760)  # a readable column, centred, when maximized
+        scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         scroll.setWidget(content)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 14)
@@ -6455,25 +6501,211 @@ class NdFitDialog(QDialog):
         )
 
 
-class NkFitDialog(QDialog):
-    """Nk Fit window (non-modal), opened from step 10 of the Nd and Nk window.
+_NK_SEGMENT_COLORS: tuple[tuple[int, int, int], ...] = (
+    (79, 195, 247), (255, 183, 77), (129, 199, 132), (229, 115, 115),
+    (186, 104, 200), (255, 213, 79), (77, 182, 172), (240, 98, 146),
+)
+_NK_RESULT_KEYS = ("n1", "k1", "error", "r0_fit", "r60_fit")
 
-    Inputs: d1 (filled in from the Nd fit, can be changed), n1 start and range,
-    k1 start and range. The wavelengths are all those of the step 4 grid; at
-    each one, R0 and R60 (step 7) and Si n2, k2 (step 6) come from the table.
-    Run does thin_film.fit_nk_spectrum in the background (real progress,
-    Cancel) and shows wavelength, n1 and k1 below; they are also added to the
-    Post Process window's table. The result is cleared when step 7 changes.
+
+def _merge_nk_segments(segments: list[dict[str, object]]) -> dict[str, np.ndarray]:
+    """Merge Nk runs into one result, sorted by wavelength.
+
+    Where runs overlap, the value with the smaller error at that wavelength is
+    kept (on an exact tie, the later run). A wavelength no run could fit is
+    kept as N/A. ``segment`` says which run each value came from.
+    """
+    best: dict[float, tuple[float, int, int]] = {}  # wavelength -> (error, run, row)
+    for run_index, segment in enumerate(segments):
+        errors = np.asarray(segment["error"], dtype=np.float64)
+        for row, wavelength in enumerate(np.asarray(segment["wavelength"], dtype=np.float64)):
+            error = float(errors[row]) if np.isfinite(errors[row]) else math.inf
+            key = round(float(wavelength), 9)
+            if key not in best or error <= best[key][0]:
+                best[key] = (error, run_index, row)
+    keys = sorted(best)
+    out: dict[str, np.ndarray] = {
+        name: np.full(len(keys), np.nan) for name in ("wavelength",) + _NK_RESULT_KEYS
+    }
+    out["segment"] = np.zeros(len(keys), dtype=int)
+    out["n1_edge"] = np.full(len(keys), "", dtype=object)
+    out["k1_edge"] = np.full(len(keys), "", dtype=object)
+    for i, key in enumerate(keys):
+        _error, run_index, row = best[key]
+        segment = segments[run_index]
+        out["wavelength"][i] = segment["wavelength"][row]
+        for name in _NK_RESULT_KEYS:
+            out[name][i] = segment[name][row]
+        out["segment"][i] = segment["id"]
+        out["n1_edge"][i] = segment["n1_edge"][row]
+        out["k1_edge"][i] = segment["k1_edge"][row]
+    return out
+
+
+def _plain_number(value: float) -> str:
+    """0.000001 rather than 1e-06; no trailing zeros."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text if text not in ("", "-0") else "0"
+
+
+def _nk_segment_text(segment: dict[str, object]) -> str:
+    fitted = int(np.isfinite(np.asarray(segment["n1"])).sum())
+    n1_low, k1_low = segment["n1_start"], segment["k1_start"]
+    return (
+        f"Run {segment['id']}: {segment['start']:g}–{segment['end']:g} nm · "
+        f"{fitted} wavelengths · n₁ {_plain_number(n1_low)}–"
+        f"{_plain_number(n1_low + segment['n1_range'])} · k₁ {_plain_number(k1_low)}–"
+        f"{_plain_number(k1_low + segment['k1_range'])} · d₁ {segment['d1']:.4f} nm"
+    )
+
+
+def _nk_edge_text(segment: dict[str, object]) -> str:
+    """Plain-words note on where n1 / k1 ended at the end of their range."""
+    wavelengths = np.asarray(segment["wavelength"])
+    notes = []
+    for key, name, low, high in (
+        ("n1_edge", "n₁", "n₁ may be below n₁ start", "n₁ may be above n₁ start + range"),
+        ("k1_edge", "k₁", "k₁ ≈ 0 there if k₁ start is near 0", "k₁ may be above k₁ start + range"),
+    ):
+        edges = np.asarray(segment[key], dtype=object)
+        for side, meaning in (("low", low), ("high", high)):
+            hits = wavelengths[edges == side]
+            if hits.size:
+                span = f"{hits[0]:g} nm" if hits.size == 1 else f"{hits[0]:g}–{hits[-1]:g} nm"
+                notes.append(
+                    f"{name} at the {side} end of its range at {hits.size} wavelength"
+                    f"{'s' if hits.size != 1 else ''} ({span}): {meaning}"
+                )
+    return "; ".join(notes)
+
+
+class _NkFitThread(QThread):
+    """Background Nk fit over one wavelength range, one wavelength at a time.
+
+    Emits point_done(index, result) after each wavelength (result is the
+    thin_film.fit_nk dict, or None where R0, R60 or Si n, k is N/A). Setting
+    stop_requested ends the loop after the current wavelength.
     """
 
-    # key, label, default (the values in Optical_NK_V7S.py; d1 from the Nd fit)
+    point_done = pyqtSignal(int, object)
+
+    def __init__(self, data: tuple[np.ndarray, ...], values: dict[str, float]) -> None:
+        super().__init__()
+        self._data = data
+        self._values = values
+        self.stop_requested = False
+
+    def run(self) -> None:  # background thread: maths only
+        wavelengths, r0, r60, n2, k2 = self._data
+        v = self._values
+        for index in range(wavelengths.size):
+            if self.stop_requested:
+                return
+            inputs = (float(r0[index]), float(r60[index]), float(n2[index]), float(k2[index]))
+            result = None
+            if all(math.isfinite(x) for x in inputs):
+                try:
+                    result = thin_film.fit_nk(
+                        float(wavelengths[index]), *inputs, v["d1"],
+                        v["n1_start"], v["n1_range"], v["k1_start"], v["k1_range"],
+                    )
+                except ValueError:
+                    result = None
+            self.point_done.emit(index, result)
+
+
+class _NkFinishDialog(QDialog):
+    """Finish: store all runs merged (Complete) or only the ticked ones (Segments)."""
+
+    def __init__(self, parent: QWidget, segments: list[dict[str, object]]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Finish Nk Fit")
+        self.setModal(True)
+        self.setStyleSheet(_ND_NK_STYLE)
+        self.setMinimumWidth(640)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel(f"<b>How should the {len(segments)} run(s) be stored?</b>"))
+        self.complete = QRadioButton("Complete: merge all runs into one result")
+        self.complete.setChecked(True)
+        self.pick = QRadioButton("Segments: choose which runs to keep")
+        layout.addWidget(self.complete)
+        layout.addWidget(self.pick)
+        self.runs = QListWidget()
+        for segment in segments:
+            item = QListWidgetItem(_nk_segment_text(segment))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            item.setForeground(QColor(*_NK_SEGMENT_COLORS[(segment["id"] - 1) % len(_NK_SEGMENT_COLORS)]))
+            item.setData(Qt.ItemDataRole.UserRole, segment["id"])
+            self.runs.addItem(item)
+        self.runs.setEnabled(False)
+        self.pick.toggled.connect(self.runs.setEnabled)
+        layout.addWidget(self.runs)
+        layout.addWidget(
+            NdNkWindow._note(
+                "Where runs overlap, the value with the smaller error at each "
+                "wavelength is kept. The stored result goes into the Post Process "
+                "table (Fitted n1, Fitted k1) and the Excel export; the runs list "
+                "is then emptied for the next set."
+            )
+        )
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.setObjectName("accentBtn")
+        cancel.clicked.connect(self.reject)
+        store = QPushButton("Store")
+        store.setObjectName("accentBtn")
+        store.setDefault(True)
+        store.clicked.connect(self._on_store)
+        row.addWidget(cancel)
+        row.addWidget(store)
+        layout.addLayout(row)
+
+    def chosen_ids(self) -> list[int]:
+        if self.complete.isChecked():
+            return [self.runs.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.runs.count())]
+        return [
+            self.runs.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.runs.count())
+            if self.runs.item(i).checkState() == Qt.CheckState.Checked
+        ]
+
+    def mode(self) -> str:
+        return "complete" if self.complete.isChecked() else "segments"
+
+    def _on_store(self) -> None:
+        if not self.chosen_ids():
+            QMessageBox.information(self, "Nothing Ticked", "Tick at least one run to keep.")
+            return
+        self.accept()
+
+
+class NkFitDialog(QDialog):
+    """Nk Fit window (non-modal), opened from step 10 of the Post Process window.
+
+    Each Run fits n1 and k1 (d1 fixed) at the interpolated wavelengths inside
+    the chosen wavelength range, in the background; n1 and k1 are plotted live
+    (stacked plots) as each wavelength is done, with a progress bar above the
+    plots (Stop discards that run). Every finished run is kept as a segment
+    until Finish, which stores either all runs merged (Complete) or the ticked
+    ones (Segments); where runs overlap, the smaller error wins. The stored
+    result goes into the Post Process table. Runs and the stored result are
+    cleared when step 7 changes.
+    """
+
+    # key, label, default (n1 / k1 values from Optical_NK_V7S.py; d1 from the Nd fit)
     _FIELDS = (
         ("d1", "d₁ (nm)", ""),
+        ("wl_start", "Wavelength start (nm)", ""),
+        ("wl_end", "Wavelength end (nm)", ""),
         ("n1_start", "n₁ start", "1.45"),
         ("n1_range", "n₁ range (Δn₁)", "0.05"),
         ("k1_start", "k₁ start", "0.000001"),
         ("k1_range", "k₁ range (Δk₁)", "0.1"),
     )
+    _STORED_COLOR = (235, 235, 235)
 
     def __init__(self, owner: NdNkWindow) -> None:
         super().__init__(
@@ -6483,22 +6715,28 @@ class NkFitDialog(QDialog):
             | Qt.WindowType.WindowCloseButtonHint,
         )
         self._owner = owner
+        self._thread: Optional[_NkFitThread] = None
+        self._run: Optional[dict[str, object]] = None  # the run in progress
+        self._paused_plots: list[QWidget] = []
+        self._curves: list[object] = []  # segment and stored-result curves
+        self._live_curves: list[object] = []
         self.setWindowTitle("Nk Fit")
         self.setModal(False)
         self.setStyleSheet(_ND_NK_STYLE)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 14)
+        # Left: inputs, Run, runs list, Finish (scrolls on small screens).
+        left = QWidget()
+        root = QVBoxLayout(left)
+        root.setContentsMargins(14, 14, 10, 14)
         root.setSpacing(10)
         root.addWidget(
             NdNkWindow._note(
-                "Finds the film's n₁ and k₁ at every interpolated wavelength (d₁ "
-                "fixed) so that the calculated R₀ and R₆₀ match the absolute R₀ and "
-                "R₆₀ from step 7. Same search as Optical_NK_V7S.py, with π, done at "
-                "each wavelength on its own."
+                "Finds the film's n₁ and k₁ (d₁ fixed) at the interpolated "
+                "wavelengths in a range, so the calculated R₀ and R₆₀ match the "
+                "absolute R₀ and R₆₀ from step 7 (search of Optical_NK_V7S.py, with "
+                "π). Run several ranges with their own n₁ / k₁ ranges, then Finish."
             )
         )
-
         inputs = QGroupBox("Inputs")
         inputs_layout = QVBoxLayout(inputs)
         inputs_layout.setSpacing(8)
@@ -6510,7 +6748,8 @@ class NkFitDialog(QDialog):
         row = 0
         for key, label, default in self._FIELDS:
             edit = QLineEdit(default)
-            validator = QDoubleValidator(0.0, 1.0e6, 6, edit)
+            decimals = 3 if key.startswith("wl_") else 6
+            validator = QDoubleValidator(0.0, 1.0e6, decimals, edit)
             validator.setNotation(QDoubleValidator.Notation.StandardNotation)
             validator.setLocale(QLocale.c())
             edit.setValidator(validator)
@@ -6522,11 +6761,13 @@ class NkFitDialog(QDialog):
             if key == "d1":
                 self._d1_source = QLabel("")
                 self._d1_source.setTextFormat(Qt.TextFormat.RichText)
+                self._d1_source.setWordWrap(True)
                 grid.addWidget(self._d1_source, row, 1)
                 row += 1
-                grid.addWidget(QLabel("Wavelengths"), row, 0)
+            if key == "wl_end":
                 self._wavelengths_label = QLabel("")
                 self._wavelengths_label.setTextFormat(Qt.TextFormat.RichText)
+                self._wavelengths_label.setWordWrap(True)
                 grid.addWidget(self._wavelengths_label, row, 1)
                 row += 1
         inputs_layout.addLayout(grid)
@@ -6550,23 +6791,21 @@ class NkFitDialog(QDialog):
         self._run_footnote = NdNkWindow._footnote()
         root.addWidget(self._run_footnote)
 
-        output = QGroupBox("Output")
-        out_layout = QVBoxLayout(output)
-        self._output_summary = NdNkWindow._note("No fit yet.")
-        out_layout.addWidget(self._output_summary)
-        self._output_warning = NdNkWindow._footnote()
-        out_layout.addWidget(self._output_warning)
-        self._output_model = _NdNkTableModel(self)
-        self._output_table = QTableView()
-        self._output_table.setModel(self._output_model)
-        self._output_table.setAlternatingRowColors(True)
-        self._output_table.verticalHeader().setDefaultSectionSize(22)
-        self._output_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self._output_table.setMinimumHeight(180)
-        out_layout.addWidget(self._output_table, stretch=1)
-        root.addWidget(output, stretch=1)
+        runs = QGroupBox("Runs (kept until Finish)")
+        runs_layout = QVBoxLayout(runs)
+        self._runs_list = QListWidget()
+        self._runs_list.setMinimumHeight(120)
+        self._runs_list.setWordWrap(True)
+        runs_layout.addWidget(self._runs_list)
+        self._finish_btn = QPushButton("Finish…")
+        self._finish_btn.setObjectName("accentBtn")
+        self._finish_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._finish_btn.setAutoDefault(False)
+        self._finish_btn.clicked.connect(self._on_finish_clicked)
+        runs_layout.addWidget(self._finish_btn)
+        self._stored_label = NdNkWindow._note("")
+        runs_layout.addWidget(self._stored_label)
+        root.addWidget(runs, stretch=1)
 
         close_row = QHBoxLayout()
         close_row.addStretch(1)
@@ -6578,15 +6817,72 @@ class NkFitDialog(QDialog):
         close_row.addWidget(close_btn)
         root.addLayout(close_row)
 
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left)
+        left.setMaximumWidth(450)  # never wider than the column (no cut-off text)
+        left_scroll.setFixedWidth(460)
+
+        # Right: progress (not a pop-up) above the live n1 / k1 plots.
+        right = QVBoxLayout()
+        right.setContentsMargins(4, 14, 14, 14)
+        right.setSpacing(8)
+        progress_row = QHBoxLayout()
+        self._progress_label = QLabel("No fit running.")
+        self._progress_label.setMinimumWidth(360)
+        progress_row.addWidget(self._progress_label)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 1000)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setFormat("%p%")
+        progress_row.addWidget(self._progress_bar, stretch=1)
+        self._stop_btn = QPushButton("Stop")
+        self._stop_btn.setObjectName("accentBtn")
+        self._stop_btn.setAutoDefault(False)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.setToolTip("Stop this run; its points are discarded.")
+        self._stop_btn.clicked.connect(self._on_stop_clicked)
+        progress_row.addWidget(self._stop_btn)
+        right.addLayout(progress_row)
+
+        self._plots = pg.GraphicsLayoutWidget()
+        self._n_plot = self._plots.addPlot(row=0, col=0)
+        self._k_plot = self._plots.addPlot(row=1, col=0)
+        self._k_plot.setXLink(self._n_plot)
+        for plot, label in ((self._n_plot, "n₁"), (self._k_plot, "k₁")):
+            plot.setLabel("left", label)
+            plot.showGrid(x=True, y=True, alpha=0.25)
+            plot.getAxis("bottom").enableAutoSIPrefix(False)
+            plot.getAxis("left").enableAutoSIPrefix(False)
+        self._k_plot.setLabel("bottom", "Wavelength (nm)")
+        self._n_plot.setTitle("n₁ and k₁ vs wavelength (each point drawn as it is calculated)")
+        self._legend = self._n_plot.addLegend(
+            offset=(-10, 10), brush=pg.mkBrush(26, 29, 35, 230), pen=pg.mkPen(80, 86, 96)
+        )
+        right.addWidget(self._plots, stretch=1)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(left_scroll)
+        outer.addLayout(right, stretch=1)
+
+        # Redraw the live plot at most every 80 ms (not on every point).
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setInterval(80)
+        self._redraw_timer.timeout.connect(self._redraw_live)
+        self._elapsed = QElapsedTimer()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._stop_and_wait)
+
         self.nd_fit_changed()
-        if owner.nk_fit is not None:
-            self._show_result(owner.nk_fit)
+        self._redraw_saved()
         self.refresh()
-        wanted = 900
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            wanted = min(wanted, screen.availableGeometry().height() - 80)
-        self.resize(640, max(500, wanted))
+        self.resize(1280, 860)
 
     # Inputs ------------------------------------------------------------
 
@@ -6596,6 +6892,10 @@ class NkFitDialog(QDialog):
         if fit is not None:
             self._edits["d1"].setText(f"{fit['d1']:.6f}")
         self.refresh()
+
+    def _grid(self) -> Optional[np.ndarray]:
+        absolute = self._owner.absolute
+        return None if absolute is None else np.asarray(absolute["grid"], dtype=np.float64)
 
     def _read_inputs(self) -> tuple[dict[str, float], list[str]]:
         values: dict[str, float] = {}
@@ -6619,7 +6919,24 @@ class NkFitDialog(QDialog):
         for key, ok, text in rules:
             if key in values and not ok(values[key]):
                 problems.append(f"{labels[key]}: {text}")
+        grid = self._grid()
+        if grid is not None and "wl_start" in values and "wl_end" in values:
+            if values["wl_end"] < values["wl_start"]:
+                problems.append("Wavelength end: must not be below the start")
+            elif self._range_indexes(values).size == 0:
+                problems.append(
+                    f"Wavelength range: no interpolated wavelength inside it (the grid "
+                    f"is {grid[0]:g}–{grid[-1]:g} nm)"
+                )
         return values, problems
+
+    def _range_indexes(self, values: dict[str, float]) -> np.ndarray:
+        grid = self._grid()
+        if grid is None:
+            return np.zeros(0, dtype=int)
+        return np.flatnonzero(
+            (grid >= values["wl_start"] - 1e-9) & (grid <= values["wl_end"] + 1e-9)
+        )
 
     def _needed(self) -> tuple[list[str], dict[str, float]]:
         needed = list(self._owner._requirements("nk_fit"))
@@ -6627,7 +6944,7 @@ class NkFitDialog(QDialog):
         return needed + problems, values
 
     def refresh(self, *_args: object) -> None:
-        """Update the d1 note, the wavelength summary and the Run footnote."""
+        """Update the notes under d1 and the wavelength range, and the footnotes."""
         ready, needs = NdNkWindow._READY_COLOR, NdNkWindow._NEEDS_COLOR
         fit = self._owner.nd_fit
         if fit is not None:
@@ -6644,147 +6961,298 @@ class NkFitDialog(QDialog):
             self._d1_source.setText(
                 f"<span style='color:{needs}'>No Nd fit yet: run step 9, or type d₁</span>"
             )
-        absolute = self._owner.absolute
-        if absolute is not None:
-            grid = np.asarray(absolute["grid"])
+        grid = self._grid()
+        if grid is not None:
+            for key, value in (("wl_start", grid[0]), ("wl_end", grid[-1])):
+                if not self._edits[key].text().strip():
+                    self._edits[key].blockSignals(True)
+                    self._edits[key].setText(f"{value:g}")
+                    self._edits[key].blockSignals(False)
+            values, _problems = self._read_inputs()
             step = (grid[-1] - grid[0]) / (grid.size - 1) if grid.size > 1 else 0.0
-            self._wavelengths_label.setText(
-                f"<span style='color:{ready}'>All {grid.size} interpolated wavelengths,"
-                f"<br>{grid[0]:.3f}–{grid[-1]:.3f} nm, step {step:g} nm (step 4)</span>"
-            )
+            if "wl_start" in values and "wl_end" in values:
+                count = self._range_indexes(values).size
+                self._wavelengths_label.setText(
+                    f"<span style='color:{ready if count else needs}'>{count} interpolated "
+                    f"wavelengths in this range<br>(grid {grid[0]:g}–{grid[-1]:g} nm, "
+                    f"step {step:g} nm)</span>"
+                )
         else:
             self._wavelengths_label.setText(
-                f"<span style='color:{needs}'>Not available yet (step 7)</span>"
+                f"<span style='color:{needs}'>Interpolated wavelengths: not available "
+                "yet (step 7)</span>"
             )
+        running = self._thread is not None
         needed, _values = self._needed()
-        self._owner._set_footnote(self._run_footnote, needed, "Ready to run.")
+        if running:
+            self._run_footnote.setText(
+                f"<span style='color:{needs}'>A run is in progress (Stop it, or wait).</span>"
+            )
+        else:
+            self._owner._set_footnote(self._run_footnote, needed, "Ready to run.")
+        self._run_btn.setEnabled(not running)
+        self._finish_btn.setEnabled(bool(self._owner.nk_segments) and not running)
+        stored = self._owner.nk_fit
+        if stored is not None:
+            used = sorted(set(int(s) for s in np.asarray(stored["segment"])))
+            mode = "Complete" if stored["mode"] == "complete" else "Segments"
+            self._stored_label.setText(
+                f"Stored in the table: {int(np.isfinite(stored['n1']).sum())} wavelengths "
+                f"({mode}: run{'s' if len(used) != 1 else ''} "
+                f"{', '.join(str(u) for u in used)} of that set)."
+            )
+        else:
+            self._stored_label.setText("Nothing stored yet: press Finish when done.")
 
     # Run ---------------------------------------------------------------
 
     def _on_run_clicked(self) -> None:
+        if self._thread is not None:
+            return
         needed, values = self._needed()
         if needed:
             self._owner._show_requirements_popup("Not Ready Yet", needed)
             return
         owner = self._owner
-        grid = np.array(owner.absolute["grid"], dtype=np.float64)
-        r0 = np.array(owner.absolute["R0"], dtype=np.float64)
-        r60 = np.array(owner.absolute["R60"], dtype=np.float64)
-        n2 = np.array(owner.si_interp["n"], dtype=np.float64)
-        k2 = np.array(owner.si_interp["k"], dtype=np.float64)
-
-        def work(report: Callable[[float], None]) -> dict[str, object]:
-            # Background thread: maths only.
-            return thin_film.fit_nk_spectrum(
-                grid, r0, r60, n2, k2, values["d1"],
-                values["n1_start"], values["n1_range"],
-                values["k1_start"], values["k1_range"],
-                report=report,
+        indexes = self._range_indexes(values)
+        data = tuple(
+            np.array(np.asarray(array, dtype=np.float64)[indexes])
+            for array in (
+                owner.absolute["grid"], owner.absolute["R0"], owner.absolute["R60"],
+                owner.si_interp["n"], owner.si_interp["k"],
             )
-
-        def done(result: dict[str, object]) -> None:
-            result.update(
-                d1=values["d1"], n1_start=values["n1_start"], n1_range=values["n1_range"],
-                k1_start=values["k1_start"], k1_range=values["k1_range"],
-            )
-            owner.nk_fit = result
-            owner._refresh_table()
-            self._show_result(result)
-            fitted = int(np.isfinite(result["n1"]).sum())
-            owner._summary.setText(
-                f"Nk fit done at {fitted} wavelengths with d₁ = {values['d1']:.4f} nm "
-                "(Fitted n1 and k1 are in the table)."
-            )
-
-        # While the fit runs (behind the modal progress pop-up), the plots stop
-        # repainting: the main window's live plot redraws several antialiased
-        # curves on every spectrometer frame, and that holds up the background
-        # calculation (about 3x slower). Data keeps arriving; painting resumes after.
-        plots = [
+        )
+        run_id = owner.nk_run_counter + 1
+        owner.nk_run_counter = run_id
+        count = data[0].size
+        self._run = {
+            "id": run_id, "start": values["wl_start"], "end": values["wl_end"],
+            "d1": values["d1"], "n1_start": values["n1_start"], "n1_range": values["n1_range"],
+            "k1_start": values["k1_start"], "k1_range": values["k1_range"],
+            "wavelength": data[0].copy(),
+            **{name: np.full(count, np.nan) for name in _NK_RESULT_KEYS},
+            "n1_edge": np.full(count, "", dtype=object),
+            "k1_edge": np.full(count, "", dtype=object),
+            "done": 0, "dirty": False,
+        }
+        color = _NK_SEGMENT_COLORS[(run_id - 1) % len(_NK_SEGMENT_COLORS)]
+        name = f"Run {run_id}: {values['wl_start']:g}–{values['wl_end']:g} nm (running)"
+        self._live_curves = [
+            self._n_plot.plot([], [], pen=pg.mkPen(color, width=2), symbol="o", symbolSize=5,
+                              symbolBrush=pg.mkBrush(*color), symbolPen=None, name=name),
+            self._k_plot.plot([], [], pen=pg.mkPen(color, width=2), symbol="o", symbolSize=5,
+                              symbolBrush=pg.mkBrush(*color), symbolPen=None),
+        ]
+        grid = self._grid()
+        self._n_plot.setXRange(float(grid[0]), float(grid[-1]), padding=0.02)
+        # While the fit runs, the other plots stop repainting: the main window's
+        # live plot redraws several antialiased curves on every spectrometer
+        # frame, and that holds up the background calculation (about 3x slower).
+        # Data keeps arriving; their painting resumes when the run ends.
+        self._paused_plots = [
             plot
             for window in (owner._main, owner)
             for plot in window.findChildren(pg.PlotWidget)
             if plot.updatesEnabled()
         ]
-        for plot in plots:
+        for plot in self._paused_plots:
             plot.setUpdatesEnabled(False)
-        try:
-            run_with_real_progress(self, "Running the Nk fit", work, done)
-        finally:
-            for plot in plots:
-                plot.setUpdatesEnabled(True)
-                plot.update()
+        self._thread = _NkFitThread(data, values)
+        self._thread.point_done.connect(self._on_point)
+        self._thread.finished.connect(self._on_run_finished)
+        self._progress_bar.setValue(0)
+        self._progress_label.setText(f"Run {run_id}: 0 of {count} wavelengths")
+        self._stop_btn.setEnabled(True)
+        for edit in self._edits.values():
+            edit.setEnabled(False)
+        self._elapsed.start()
+        self._redraw_timer.start()
+        self._thread.start()
+        self.refresh()
 
-    # Output ------------------------------------------------------------
+    def _on_point(self, index: int, result: Optional[dict[str, object]]) -> None:
+        run = self._run
+        if run is None:
+            return
+        if result is not None:
+            for name in _NK_RESULT_KEYS:
+                run[name][index] = result[name]
+            run["n1_edge"][index] = result["edges"]["n1"] or ""
+            run["k1_edge"][index] = result["edges"]["k1"] or ""
+        run["done"] = index + 1
+        run["dirty"] = True
 
-    def _show_result(self, result: dict[str, object]) -> None:
-        wavelengths = np.asarray(result["wavelength"])
-        n1 = np.asarray(result["n1"])
-        k1 = np.asarray(result["k1"])
-        self._output_model.set_columns(
-            [("Wavelength (nm)", wavelengths), ("n₁", n1), ("k₁", k1)]
+    def _redraw_live(self) -> None:
+        run = self._run
+        if run is None or not run["dirty"]:
+            return
+        run["dirty"] = False
+        done = run["done"]
+        count = run["wavelength"].size
+        wavelengths = run["wavelength"][:done]
+        for curve, key in zip(self._live_curves, ("n1", "k1")):
+            values = run[key][:done]
+            ok = np.isfinite(values)
+            curve.setData(wavelengths[ok], values[ok])
+        self._progress_bar.setValue(int(round(1000 * done / max(count, 1))))
+        seconds = self._elapsed.elapsed() / 1000.0
+        left = seconds * (count - done) / done if done else 0.0
+        self._progress_label.setText(
+            f"Run {run['id']}: {done} of {count} wavelengths · {seconds:.1f} s elapsed · "
+            f"about {left:.1f} s left"
         )
-        fitted = np.isfinite(n1)
-        self._output_summary.setText(
-            f"Fitted {int(fitted.sum())} of {wavelengths.size} wavelengths "
-            f"({wavelengths[0]:.3f}–{wavelengths[-1]:.3f} nm) with d₁ = "
-            f"{result['d1']:.4f} nm, n₁ {result['n1_start']:g}–"
-            f"{result['n1_start'] + result['n1_range']:g}, k₁ {result['k1_start']:g}–"
-            f"{result['k1_start'] + result['k1_range']:g}. Also in the Post Process "
-            "window's table (Fitted n1, Fitted k1)."
-        )
 
-        def where(mask: np.ndarray) -> str:
-            hits = wavelengths[mask]
-            if hits.size == 0:
-                return ""
-            span = f"{hits[0]:g} nm" if hits.size == 1 else f"between {hits[0]:g} and {hits[-1]:g} nm"
-            return f"{hits.size} wavelength{'s' if hits.size != 1 else ''} ({span})"
+    def _on_stop_clicked(self) -> None:
+        if self._thread is not None:
+            self._thread.stop_requested = True
+            self._stop_btn.setEnabled(False)
+            self._progress_label.setText("Stopping…")
 
-        n1_edge = np.asarray(result["n1_edge"], dtype=object)
-        k1_edge = np.asarray(result["k1_edge"], dtype=object)
-        warnings = []
-        if (n1_edge == "low").any():
-            warnings.append(
-                f"n₁ ended at the low end of its range at {where(n1_edge == 'low')}: the "
-                "best n₁ may be below n₁ start there."
+    def _on_run_finished(self) -> None:
+        thread, run = self._thread, self._run
+        self._thread = None
+        self._run = None
+        self._redraw_timer.stop()
+        for plot in self._paused_plots:
+            plot.setUpdatesEnabled(True)
+            plot.update()
+        self._paused_plots = []
+        for edit in self._edits.values():
+            edit.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        if thread is not None:
+            thread.deleteLater()
+        stopped = thread is None or thread.stop_requested or run is None or run.get("discard")
+        for curve in self._live_curves:
+            for plot in (self._n_plot, self._k_plot):
+                if curve in plot.listDataItems():
+                    plot.removeItem(curve)
+        self._live_curves = []
+        if stopped:
+            if run is not None and not run.get("discard"):
+                self._progress_label.setText(
+                    f"Run {run['id']} stopped: its points were discarded."
+                )
+                self._progress_bar.setValue(0)
+        else:
+            run.pop("dirty", None)
+            run.pop("done", None)
+            seconds = self._elapsed.elapsed() / 1000.0
+            self._owner.nk_segments.append(run)
+            self._progress_bar.setValue(1000)
+            self._progress_label.setText(
+                f"Run {run['id']} done: {run['wavelength'].size} wavelengths in "
+                f"{seconds:.1f} s."
             )
-        if (n1_edge == "high").any():
-            warnings.append(
-                f"n₁ ended at the high end of its range at {where(n1_edge == 'high')}: the "
-                "best n₁ may be above n₁ start + range there."
+            self._owner._summary.setText(
+                f"Nk fit run {run['id']} done ({run['start']:g}–{run['end']:g} nm). "
+                "Press Finish in the Nk Fit window when all ranges are done."
             )
-        if (k1_edge == "low").any():
-            warnings.append(
-                f"k₁ ended at the low end of its range at {where(k1_edge == 'low')} (with "
-                "k₁ start near 0 this just means k₁ ≈ 0 there)."
-            )
-        if (k1_edge == "high").any():
-            warnings.append(
-                f"k₁ ended at the high end of its range at {where(k1_edge == 'high')}: "
-                "the best k₁ may be above k₁ start + range there."
-            )
-        if (~fitted).any():
-            warnings.append(
-                f"No fit at {where(~fitted)}: R₀, R₆₀ or Si n, k is N/A there."
-            )
-        self._output_warning.setText(
-            "".join(
-                f"<p style='color:{NdNkWindow._NEEDS_COLOR}; margin:0 0 4px 0'>{text}</p>"
-                for text in warnings
-            )
+        self._redraw_saved()
+        self._owner._update_footnotes()
+        self.refresh()
+
+    def _stop_and_wait(self) -> None:
+        """App closing: end a running fit cleanly."""
+        thread = self._thread
+        if thread is not None:
+            thread.stop_requested = True
+            thread.wait(5000)
+
+    # Runs list, stored result and plots ----------------------------------
+
+    def _redraw_saved(self) -> None:
+        """Plot the finished runs (own colours) and the stored result (white)."""
+        for curve in self._curves:
+            for plot in (self._n_plot, self._k_plot):
+                if curve in plot.listDataItems():
+                    plot.removeItem(curve)
+        self._curves = []
+        self._runs_list.clear()
+        stored = self._owner.nk_fit
+        if stored is not None:
+            pen = pg.mkPen(self._STORED_COLOR, width=2)
+            for plot, key, name in ((self._n_plot, "n1", "Stored result"), (self._k_plot, "k1", None)):
+                values = np.asarray(stored[key])
+                ok = np.isfinite(values)
+                self._curves.append(
+                    plot.plot(np.asarray(stored["wavelength"])[ok], values[ok], pen=pen,
+                              symbol="o", symbolSize=4, symbolBrush=pg.mkBrush(*self._STORED_COLOR),
+                              symbolPen=None, name=name)
+                )
+        for segment in self._owner.nk_segments:
+            color = _NK_SEGMENT_COLORS[(segment["id"] - 1) % len(_NK_SEGMENT_COLORS)]
+            for plot, key, name in (
+                (self._n_plot, "n1", f"Run {segment['id']}: {segment['start']:g}–{segment['end']:g} nm"),
+                (self._k_plot, "k1", None),
+            ):
+                values = np.asarray(segment[key])
+                ok = np.isfinite(values)
+                self._curves.append(
+                    plot.plot(np.asarray(segment["wavelength"])[ok], values[ok],
+                              pen=pg.mkPen(color, width=2), symbol="o", symbolSize=4,
+                              symbolBrush=pg.mkBrush(*color), symbolPen=None, name=name)
+                )
+            item = QListWidgetItem(_nk_segment_text(segment))
+            item.setForeground(QColor(*color))
+            edges = _nk_edge_text(segment)
+            if edges:
+                item.setText(item.text() + "  ⚠")
+                item.setToolTip(edges)
+            self._runs_list.addItem(item)
+        grid = self._grid()
+        if grid is not None:
+            self._n_plot.setXRange(float(grid[0]), float(grid[-1]), padding=0.02)
+
+    def _on_finish_clicked(self) -> None:
+        segments = list(self._owner.nk_segments)
+        if not segments or self._thread is not None:
+            return
+        dialog = _NkFinishDialog(self, segments)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.finish(dialog.mode(), dialog.chosen_ids())
+
+    def finish(self, mode: str, chosen_ids: list[int]) -> None:
+        """Store the chosen runs (merged, smaller error wins) and empty the list."""
+        segments = [s for s in self._owner.nk_segments if s["id"] in chosen_ids]
+        if not segments:
+            return
+        merged = _merge_nk_segments(segments)
+        merged["mode"] = mode
+        merged["runs"] = [
+            {key: s[key] for key in ("id", "start", "end", "d1", "n1_start", "n1_range", "k1_start", "k1_range")}
+            for s in segments
+        ]
+        owner = self._owner
+        owner.nk_fit = merged
+        owner.nk_segments = []
+        owner._refresh_table()
+        fitted = int(np.isfinite(merged["n1"]).sum())
+        owner._summary.setText(
+            f"Nk fit stored: {fitted} wavelengths from run(s) "
+            f"{', '.join(str(s['id']) for s in segments)} ({'Complete' if mode == 'complete' else 'Segments'}). "
+            "Fitted n1 and k1 are in the table."
         )
+        self._progress_label.setText(f"Stored {fitted} wavelengths.")
+        self._redraw_saved()
+        self.refresh()
 
     def results_cleared(self, had_result: bool) -> None:
-        """Step 7's values changed: the shown fit no longer applies."""
-        self._output_model.set_columns([])
-        self._output_warning.setText("")
-        self._output_summary.setText(
-            "The absolute reflectance changed, so the last fit was cleared. Run the "
-            "fit again."
+        """Step 7's values changed: runs and the stored result no longer apply."""
+        if self._thread is not None:
+            self._thread.stop_requested = True
+            if self._run is not None:
+                self._run["discard"] = True
+        self._redraw_saved()
+        self._progress_bar.setValue(0)
+        self._progress_label.setText(
+            "The absolute reflectance changed, so the runs and the stored result "
+            "were cleared."
             if had_result
-            else "No fit yet."
+            else "No fit running."
         )
+        self.refresh()
 
 
 class SpectrometerAppWithNdNk(SpectrometerApp):
@@ -6811,6 +7279,10 @@ class SpectrometerAppWithNdNk(SpectrometerApp):
             background-color: #1e2229; color: #6b7280; border: 1px solid #2a2f3a;
         }
     """
+
+    def show(self) -> None:
+        """main() calls show() once at start-up: open maximized instead."""
+        self.showMaximized()
 
     def _build_ui(self) -> None:
         """Build the original window, then move the Capture button and the
@@ -6887,10 +7359,7 @@ class SpectrometerAppWithNdNk(SpectrometerApp):
     def _open_nd_nk_window(self) -> None:
         if self._nd_nk_window is None:
             self._nd_nk_window = NdNkWindow(self)
-        window = self._nd_nk_window
-        window.show()
-        window.raise_()
-        window.activateWindow()
+        _show_maximized(self._nd_nk_window)
 
     def _refresh_status(self) -> None:
         super()._refresh_status()
