@@ -3994,13 +3994,18 @@ class SpectrometerApp(QMainWindow):
 
 
 # ===========================================================================
-# ADDED FEATURE: Nd and Nk window
+# ADDED FEATURE: Nd and Nk window (shown as the "Post Process" window)
 # ---------------------------------------------------------------------------
-# A separate window, opened by the "Nd and Nk" button at the right end of the
-# main window's top row (next to the R0 / R60 / T mode buttons).
+# A separate window, opened by the main window's Post Process button (which
+# used to open the original Post Process dialog; that dialog's code is kept).
+# Step 1 chooses what to calculate:
+#   * Absolute reflectance: R0, R60 or both (any mode with Baseline, Standard
+#     and Sample), steps 1-8;
+#   * n1 and k1: needs R0 and R60, steps 1-10;
+#   * T (transmission): placeholder button, disabled, nothing behind it yet.
 # Workflow (one numbered step per button, in this order):
-#   1 Measurements (R0 and R60: main-window captures, or Import Measurement
-#     File here)                                         2 Average
+#   1 What to calculate + measurements (main-window captures, or Import
+#     Measurement File here)                             2 Average
 #   3 Relative reflectance   4 Interpolate reflectance   5 Import Si values
 #   6 Interpolate Si values  7 Absolute reflectance      8 Plot (Graph tab)
 #   9 Nd fit: opens the Nd Fit window (n1 and d1 at one wavelength, the search
@@ -4012,7 +4017,7 @@ class SpectrometerApp(QMainWindow):
 # (thin_film.si_wafer_reflectance_excel).
 # The table shows every step's output. Redoing a step clears the steps after
 # it. Each button has a footnote saying what it still needs, and a pop-up if
-# it is clicked before then. Later stages add the Nd and Nk fits.
+# it is clicked before then.
 #
 # Everything in this block is new. The original code is unchanged apart from
 # one word in main():  SpectrometerApp()  ->  SpectrometerAppWithNdNk()
@@ -4097,6 +4102,32 @@ QPushButton:hover {
 }
 QPushButton:disabled {
     color: #6d7480;
+}
+QPushButton#calcChoiceBtn {
+    /* Step 1 choice: amber, so it stands apart from the teal used elsewhere. */
+    background-color: #2b2214;
+    color: #ffc266;
+    border: 1px solid #b7791f;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 14px;
+    font-weight: 600;
+    text-align: left;
+}
+QPushButton#calcChoiceBtn:hover:!disabled {
+    background-color: #3a2c15;
+    border: 1px solid #ffb347;
+}
+QPushButton#calcChoiceBtn:checked {
+    background-color: #f0a030;
+    color: #14161c;
+    border: 2px solid #ffc266;
+    font-weight: 700;
+}
+QPushButton#calcChoiceBtn:disabled {
+    background-color: #1a1e26;
+    color: #5c6370;
+    border: 1px dashed #3a4150;
 }
 QPushButton#accentBtn {
     background-color: #123e4f;
@@ -4464,7 +4495,7 @@ def _write_results_workbook(
             f'{header}<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/'
             'metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" '
             'xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/'
-            'XMLSchema-instance"><dc:title>Nd and Nk results</dc:title><dc:creator>'
+            'XMLSchema-instance"><dc:title>Post Process results</dc:title><dc:creator>'
             'Multi-Function Optical Analyzer</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">'
             f'{datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")}</dcterms:created></cp:coreProperties>'
         ),
@@ -4536,11 +4567,14 @@ class NdNkWindow(QDialog):
             | Qt.WindowType.WindowCloseButtonHint,
         )
         self._main = main_window
-        self.setWindowTitle("Nd and Nk")
+        self.setWindowTitle("Post Process")
         self.setModal(False)
         self.resize(1320, 860)
         self.setStyleSheet(_ND_NK_STYLE)
 
+        # Step 1 choice: "absolute" (absolute reflectance only: R0, R60 or both,
+        # steps 1-8) or "nk" (n1 and k1: R0 and R60, steps 1-10). None until chosen.
+        self.calculation: Optional[str] = None
         # Inputs (kept until replaced).
         self.si_wavelength: Optional[np.ndarray] = None
         self.si_n: Optional[np.ndarray] = None
@@ -4548,7 +4582,8 @@ class NdNkWindow(QDialog):
         self._si_source = ""
         # Results of each step. Redoing a step clears the steps after it, and
         # new R0 / R60 measurements clear all of them.
-        self.averages: Optional[dict[object, object]] = None  # {"window", (mode, slot): array}
+        # {"window", "modes": (R0 and/or R60), (mode, slot): array}
+        self.averages: Optional[dict[object, object]] = None
         self.relative: Optional[dict[str, np.ndarray]] = None  # {mode: array}, detector axis
         self.relative_interp: Optional[dict[str, object]] = None  # {"grid", "method", mode: array}
         self.si_interp: Optional[dict[str, object]] = None  # {"grid", "n", "k", "method", "same_grid"}
@@ -4590,6 +4625,7 @@ class NdNkWindow(QDialog):
         body.addWidget(self._build_results_tabs(), stretch=1)
         root.addLayout(body, stretch=1)
 
+        self._apply_calculation_visibility()  # only step 1 until a choice is made
         self.sync_measurements()
         self._refresh_table()
 
@@ -4603,6 +4639,7 @@ class NdNkWindow(QDialog):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 4, 0)
         layout.setSpacing(10)
+        self._step_groups: list[QGroupBox] = []  # steps 1..10, in order
         for build in (
             self._build_measurements_group,
             self._build_average_group,
@@ -4615,7 +4652,12 @@ class NdNkWindow(QDialog):
             self._build_nd_fit_group,
             self._build_nk_fit_group,
         ):
-            layout.addWidget(build())
+            group = build()
+            # Fixed height: when the steps are taller than the window the sidebar
+            # scrolls, instead of squeezing a box and hiding its last lines.
+            group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            self._step_groups.append(group)
+            layout.addWidget(group)
         layout.addStretch(1)
 
         scroll = QScrollArea()
@@ -4680,10 +4722,40 @@ class NdNkWindow(QDialog):
             edit.textChanged.connect(self._update_footnotes)
         return form, start, end, step
 
+    _CALCULATIONS = (
+        # key, button text, note under it
+        ("absolute", "Absolute reflectance", "R₀, R₆₀ or both · steps 1–8"),
+        ("nk", "n₁ and k₁", "needs R₀ and R₆₀ · steps 1–10"),
+        ("t", "T (transmission)", "placeholder, not set up yet"),
+    )
+
     def _build_measurements_group(self) -> QGroupBox:
-        group = QGroupBox("1 · Measurements")
+        group = QGroupBox("1 · What to calculate")
         layout = QVBoxLayout(group)
         layout.setSpacing(6)
+        self._calc_group = QButtonGroup(self)
+        self._calc_group.setExclusive(True)
+        self._calc_buttons: dict[str, QPushButton] = {}
+        for key, text, note in self._CALCULATIONS:
+            button = QPushButton(text)
+            button.setObjectName("calcChoiceBtn")
+            button.setCheckable(True)
+            button.setMinimumHeight(38)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            if key == "t":
+                button.setEnabled(False)  # placeholder: nothing behind it yet
+                button.setToolTip("Placeholder for T (transmission): not set up yet.")
+            else:
+                button.clicked.connect(lambda _checked=False, k=key: self._set_calculation(k))
+            self._calc_group.addButton(button)
+            self._calc_buttons[key] = button
+            layout.addWidget(button)
+            hint = self._note(note)
+            hint.setContentsMargins(4, 0, 0, 4)
+            layout.addWidget(hint)
+        heading = QLabel("Measurements")
+        heading.setStyleSheet("font-weight: 600; margin-top: 6px;")
+        layout.addWidget(heading)
         self._measurement_labels: dict[str, QLabel] = {}
         for mode, _angle in _ND_NK_MODES:
             label = QLabel("")
@@ -4961,13 +5033,56 @@ class NdNkWindow(QDialog):
     # Requirements (footnotes and pop-ups)
     # ------------------------------------------------------------------
 
-    def _missing_measurements(self) -> list[str]:
+    def _set_calculation(self, key: str) -> None:
+        """Step 1 choice: show steps 2-8 (absolute) or 2-10 (n1 and k1).
+
+        Results are kept when switching; steps 9 and 10 are only hidden.
+        """
+        self.calculation = key
+        self._calc_buttons[key].setChecked(True)
+        self._apply_calculation_visibility()
+        self._update_footnotes()
+        if not self._has_results():
+            self._refresh_table()
+
+    def _apply_calculation_visibility(self) -> None:
+        last_step = {None: 1, "absolute": 8, "nk": 10}[self.calculation]
+        for number, group in enumerate(self._step_groups, start=1):
+            group.setVisible(number <= last_step)
+
+    def _missing_measurements(self, modes: Optional[tuple[str, ...]] = None) -> list[str]:
+        modes = modes or tuple(mode for mode, _angle in _ND_NK_MODES)
         return [
             f"{_display_mode(mode)} {slot}"
-            for mode, _angle in _ND_NK_MODES
+            for mode in modes
             for slot in _ND_NK_SLOTS
             if self._measurement(mode, slot) is None
         ]
+
+    def _complete_modes(self) -> tuple[str, ...]:
+        """R0 / R60 with all of Baseline, Standard and Sample available."""
+        return tuple(
+            mode
+            for mode, _angle in _ND_NK_MODES
+            if all(self._measurement(mode, slot) is not None for slot in _ND_NK_SLOTS)
+        )
+
+    def _planned_modes(self) -> tuple[str, ...]:
+        """The modes step 2 would average now: both for n1 and k1; for absolute
+        reflectance, every mode that has all three traces (R0, R60 or both)."""
+        if self.calculation == "nk":
+            return tuple(mode for mode, _angle in _ND_NK_MODES)
+        return self._complete_modes()
+
+    def _result_modes(self) -> tuple[str, ...]:
+        """The modes the current results were calculated for."""
+        if self.averages is not None:
+            return tuple(self.averages["modes"])
+        return ()
+
+    @staticmethod
+    def _modes_text(modes: tuple[str, ...]) -> str:
+        return " and ".join(_display_mode(mode) for mode in modes)
 
     @staticmethod
     def _read_grid_fields(start: QLineEdit, end: QLineEdit, step: QLineEdit) -> tuple[float, float, float]:
@@ -5017,18 +5132,26 @@ class NdNkWindow(QDialog):
         """What a step still needs, in plain words (empty list = ready)."""
         needed: list[str] = []
         if step == "average":
-            missing = self._missing_measurements()
-            if missing:
+            if self.calculation is None:
+                needed.append("A choice in step 1: what to calculate")
+            elif self.calculation == "nk" and self._missing_measurements():
                 needed.append(
-                    "Measurements: " + ", ".join(missing)
+                    "Measurements: " + ", ".join(self._missing_measurements())
                     + " (capture in the main window, or Import Measurement File)"
+                )
+            elif self.calculation == "absolute" and not self._complete_modes():
+                missing = self._missing_measurements()
+                needed.append(
+                    "Baseline, Standard and Sample for R₀, R₆₀ or both ("
+                    + ("" if len(missing) == 6 else "still missing: " + ", ".join(missing) + "; ")
+                    + "capture in the main window, or Import Measurement File)"
                 )
             elif self._axis() is None:
                 needed.append("A wavelength axis (capture or import a trace)")
             else:
                 shortest = min(
                     np.asarray(self._measurement(mode, slot)).size
-                    for mode, _angle in _ND_NK_MODES
+                    for mode in self._planned_modes()
                     for slot in _ND_NK_SLOTS
                 )
                 if self._window_spin.value() > shortest:
@@ -5076,6 +5199,12 @@ class NdNkWindow(QDialog):
         elif step in ("nd_fit", "nk_fit"):
             if self.absolute is None:
                 needed.append("Absolute reflectance (step 7)")
+            elif any(mode not in self.absolute for mode, _angle in _ND_NK_MODES):
+                needed.append(
+                    "Absolute reflectance for both R₀ and R₆₀ (it was calculated for "
+                    f"{self._modes_text(self._result_modes())} only: with both "
+                    "measured, press step 2 again and redo steps 3–7)"
+                )
         elif step == "save_graph":
             if not self.plotted:
                 needed.append("A plotted graph (step 8: Plot Absolute Reflectance)")
@@ -5090,16 +5219,52 @@ class NdNkWindow(QDialog):
         return a.shape == b.shape and bool(np.allclose(a, b, rtol=0.0, atol=1e-9))
 
     def _update_footnotes(self, *_args: object) -> None:
-        missing = self._missing_measurements()
-        self._set_footnote(
-            self._measurement_footnote,
-            [f"{name} (capture in the main window, or Import Measurement File)" for name in missing],
-            "All six traces are available.",
-        )
+        complete = self._complete_modes()
+        if self.calculation is None:
+            self._measurement_footnote.setText(
+                f"<span style='color:{self._NEEDS_COLOR}'>Choose what to calculate "
+                "above.</span>"
+            )
+        elif self.calculation == "nk":
+            self._set_footnote(
+                self._measurement_footnote,
+                [
+                    f"{name} (capture in the main window, or Import Measurement File)"
+                    for name in self._missing_measurements()
+                ],
+                "All six traces are available.",
+            )
+        elif not complete:
+            self._set_footnote(
+                self._measurement_footnote,
+                ["Baseline, Standard and Sample for R₀, R₆₀ or both (capture in the "
+                 "main window, or Import Measurement File)"],
+                "",
+            )
+        else:
+            incomplete = [
+                mode for mode, _angle in _ND_NK_MODES
+                if mode not in complete and self._missing_measurements((mode,)) != [
+                    f"{_display_mode(mode)} {slot}" for slot in _ND_NK_SLOTS
+                ]
+            ]
+            text = f"{self._modes_text(complete)} complete: will be calculated."
+            if incomplete:
+                text += " " + "; ".join(
+                    f"{_display_mode(mode)} is incomplete (missing "
+                    + ", ".join(self._missing_measurements((mode,))) + ") and will be skipped"
+                    for mode in incomplete
+                ) + "."
+            self._set_footnote(self._measurement_footnote, [], text)
         def ready(result: object, done_text: str, ready_text: str) -> str:
             return f"{done_text} Press again to redo." if result is not None else ready_text
 
-        window_text = f"Done (window {self.averages['window']} points)." if self.averages else ""
+        window_text = (
+            f"Done for {self._modes_text(self._result_modes())} "
+            f"(window {self.averages['window']} points)."
+            if self.averages
+            else ""
+        )
         self._set_footnote(
             self._average_footnote,
             self._requirements("average"),
@@ -5326,13 +5491,14 @@ class NdNkWindow(QDialog):
         return True
 
     def _average_all(self) -> bool:
-        """Step 2: centred moving average of all six traces."""
+        """Step 2: centred moving average of the traces of every mode in use."""
         axis = self._axis()
         window = int(self._window_spin.value())
         inputs = self._measurement_inputs()
-        averages: dict[object, object] = {"window": window}
+        modes = self._planned_modes()
+        averages: dict[object, object] = {"window": window, "modes": modes}
         try:
-            for mode, _angle in _ND_NK_MODES:
+            for mode in modes:
                 for slot in _ND_NK_SLOTS:
                     trace = np.asarray(self._measurement(mode, slot), dtype=np.float64)
                     if trace.shape != axis.shape:
@@ -5347,7 +5513,10 @@ class NdNkWindow(QDialog):
         self._clear_from("average")
         self.averages = averages
         self._results_inputs = inputs
-        return self._step_done(f"Averaged all six traces (window {window} points).")
+        return self._step_done(
+            f"Averaged the {self._modes_text(modes)} traces ({3 * len(modes)} traces, "
+            f"window {window} points)."
+        )
 
     def _calculate_relative(self) -> bool:
         """Step 3: relative reflectance on the detector axis."""
@@ -5357,14 +5526,17 @@ class NdNkWindow(QDialog):
                 self.averages[(mode, CaptureMode.BASELINE.value)],
                 self.averages[(mode, CaptureMode.STANDARD.value)],
             )
-            for mode, _angle in _ND_NK_MODES
+            for mode in self._result_modes()
         }
         self._clear_from("relative")
         self.relative = relative
-        finite = {mode: int(np.isfinite(values).sum()) for mode, values in relative.items()}
+        counts = ", ".join(
+            f"{_display_mode(mode)} {int(np.isfinite(values).sum())} points"
+            for mode, values in relative.items()
+        )
         return self._step_done(
-            f"Relative reflectance calculated: R₀ {finite['R0']} points, "
-            f"R₆₀ {finite['R60']} points (edge points are N/A after averaging)."
+            f"Relative reflectance calculated: {counts} (edge points are N/A after "
+            "averaging)."
         )
 
     def _interpolate_reflectance(self) -> bool:
@@ -5374,7 +5546,7 @@ class NdNkWindow(QDialog):
         try:
             grid = self._reflectance_grid()
             result: dict[str, object] = {"grid": grid, "method": method}
-            for mode, _angle in _ND_NK_MODES:
+            for mode in self._result_modes():
                 result[mode] = _interpolate_reflectance_series(
                     axis, self.relative[mode], grid, method
                 )
@@ -5427,7 +5599,9 @@ class NdNkWindow(QDialog):
         """Step 7: interpolated relative reflectance x bare-Si reflectance."""
         grid = np.asarray(self.relative_interp["grid"])
         result: dict[str, object] = {"grid": grid}
-        for mode, angle in _ND_NK_MODES:
+        angles = dict(_ND_NK_MODES)
+        for mode in self._result_modes():
+            angle = angles[mode]
             # Same method as the lab's Excel sheet (Si_Std_Fit_Full): every step
             # rounded to 4 decimals, with true pi (thin_film.PI). See thin_film.py.
             si_r = thin_film.si_wafer_reflectance_excel(
@@ -5437,10 +5611,13 @@ class NdNkWindow(QDialog):
             result[mode] = np.asarray(self.relative_interp[mode]) * si_r
         self._clear_from("absolute")
         self.absolute = result
-        finite = np.isfinite(result["R0"]) & np.isfinite(result["R60"])
+        modes = self._result_modes()
+        finite = np.ones(grid.size, dtype=bool)
+        for mode in modes:
+            finite &= np.isfinite(np.asarray(result[mode]))
         return self._step_done(
-            f"Absolute reflectance calculated on {grid.size} points "
-            f"({int(finite.sum())} with both R₀ and R₆₀). Next: step 8, Plot."
+            f"Absolute reflectance ({self._modes_text(modes)}) calculated on {grid.size} "
+            f"points ({int(finite.sum())} with a value). Next: step 8, Plot."
         )
 
     def _on_plot_clicked(self) -> None:
@@ -5451,14 +5628,15 @@ class NdNkWindow(QDialog):
             return
         self._plot_widget.clear()
         grid = np.asarray(self.absolute["grid"])
+        shown = [(mode, angle) for mode, angle in _ND_NK_MODES if mode in self.absolute]
         curves = [
             (mode, f"{_display_mode(mode)} absolute ({angle:g}°{', s-pol' if angle else ''})",
              np.asarray(self.absolute[mode]), Qt.PenStyle.SolidLine, 1)
-            for mode, angle in _ND_NK_MODES
+            for mode, angle in shown
         ] + [
             (mode, f"Si {_display_mode(mode)} ({angle:g}°{', s-pol' if angle else ''})",
              np.asarray(self.absolute[f"si_r_{mode}"]), Qt.PenStyle.DashLine, 0)
-            for mode, angle in _ND_NK_MODES
+            for mode, angle in shown
         ]
         for mode, name, values, style, z in curves:
             curve = self._plot_widget.plot(
@@ -5750,17 +5928,17 @@ class NdNkWindow(QDialog):
                 columns.append((f"{mode}_{slot} (counts)", self._measurement(mode, slot)))
             if self.averages is not None:  # 2. averages
                 window = self.averages["window"]
-                for mode, _angle in _ND_NK_MODES:
+                for mode in self._result_modes():
                     for slot in _ND_NK_SLOTS:
                         columns.append(
                             (f"{mode}_{slot}_Avg_W{window} (counts)", self.averages[(mode, slot)])
                         )
             if self.relative is not None:  # 3. relative reflectance
-                for mode, _angle in _ND_NK_MODES:
+                for mode in self.relative:
                     columns.append((f"{mode} Relative Reflectance", self.relative[mode]))
         if self.relative_interp is not None:  # 4. interpolated reflectance
             columns.append(("Interp Wavelength (nm)", self.relative_interp["grid"]))
-            for mode, _angle in _ND_NK_MODES:
+            for mode in self._result_modes():
                 columns.append(
                     (f"{mode} Interpolated Relative Reflectance", self.relative_interp[mode])
                 )
@@ -5771,11 +5949,11 @@ class NdNkWindow(QDialog):
                 ("Interpolated Si k", self.si_interp["k"]),
             ]
         if self.absolute is not None:  # 7. absolute reflectance
+            si_headers = {"R0": "Si R0 (0°)", "R60": "Si R60 (60°, s-pol)"}
+            modes = [mode for mode, _angle in _ND_NK_MODES if mode in self.absolute]
+            columns += [(si_headers[mode], self.absolute[f"si_r_{mode}"]) for mode in modes]
             columns += [
-                ("Si R0 (0°)", self.absolute["si_r_R0"]),
-                ("Si R60 (60°, s-pol)", self.absolute["si_r_R60"]),
-                ("R0 Absolute Reflectance", self.absolute["R0"]),
-                ("R60 Absolute Reflectance", self.absolute["R60"]),
+                (f"{mode} Absolute Reflectance", self.absolute[mode]) for mode in modes
             ]
         if self.nk_fit is not None:  # 10. Nk fit
             columns += [
@@ -5793,8 +5971,12 @@ class NdNkWindow(QDialog):
         self._shown_inputs = self._measurement_inputs()
         if not self._has_results():
             self._summary.setText(
-                "Follow the steps in order. Measurements come from the main window's "
-                "captures or from Import Measurement File in step 1."
+                "Choose what to calculate in step 1, then follow the steps in order. "
+                "Measurements come from the main window's captures or from Import "
+                "Measurement File in step 1."
+                if self.calculation is None
+                else "Follow the steps in order. Measurements come from the main "
+                "window's captures or from Import Measurement File in step 1."
             )
         self._update_footnotes()
 
@@ -5806,10 +5988,10 @@ class NdNkWindow(QDialog):
             return
         excel_filter = "Excel workbook: table, graph, settings and fits (*.xlsx)"
         csv_filter = "CSV file: table only (*.csv)"
-        default_name = f"nd_nk_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_name = f"post_process_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         path_str, selected = QFileDialog.getSaveFileName(
             self,
-            "Export Nd and Nk Results",
+            "Export Post Process Results",
             str(Path.home() / default_name),
             f"{excel_filter};;{csv_filter}",
         )
@@ -5857,7 +6039,7 @@ class NdNkWindow(QDialog):
             "si_R0": "Si R0 (0°)",
             "si_R60": "Si R60 (60°, s-pol)",
         }
-        if any(name not in headers for name in names.values()):
+        if names["x"] not in headers:
             return None
         grid = np.asarray(self.absolute["grid"])
         colors = {mode: "%02X%02X%02X" % self._PLOT_COLORS[mode] for mode in ("R0", "R60")}
@@ -5868,6 +6050,8 @@ class NdNkWindow(QDialog):
             ("si_R0", "Si R₀ (0°)", "R0", True),
             ("si_R60", "Si R₆₀ (60°, s-pol)", "R60", True),
         ):
+            if names[key] not in headers:
+                continue  # that mode was not calculated
             series.append(
                 {
                     "name": label, "color": colors[mode], "dashed": dashed,
@@ -5876,6 +6060,8 @@ class NdNkWindow(QDialog):
                     "length": grid.size,
                 }
             )
+        if not series:
+            return None
         return {
             "title": "Absolute reflectance and bare-Si reflectance vs wavelength",
             "x_title": "Wavelength (nm)",
@@ -5888,7 +6074,15 @@ class NdNkWindow(QDialog):
     def _export_info_rows(self) -> list[tuple[object, object, bool]]:
         """Settings and fit results for the "Settings and fits" sheet."""
         rows: list[tuple[object, object, bool]] = [
-            ("Nd and Nk results", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), True),
+            ("Post Process results", datetime.now().strftime("%Y-%m-%d %H:%M:%S"), True),
+            (
+                "Calculation (step 1)",
+                {"absolute": "Absolute reflectance", "nk": "n₁ and k₁"}.get(
+                    self.calculation or "", "not chosen"
+                ),
+                False,
+            ),
+            ("Modes", self._modes_text(self._result_modes()) or "none yet", False),
             ("π used", "true π (3.14159265…)", False),
             ("", "", False),
             ("Calculation settings", "", True),
@@ -5957,7 +6151,7 @@ class NdFitDialog(QDialog):
     """Nd Fit window (non-modal), opened from step 9 of the Nd and Nk window.
 
     Inputs: wavelength, n1 start and range, k1, d1 start and range. R0 and R60
-    (measured) and Si n2, k2 are read from the Nd and Nk window's table at that
+    (measured) and Si n2, k2 are read from the Post Process window's table at that
     wavelength. Run does thin_film.fit_nd and shows n1, d1, the error, and the
     measured and fitted R60 and R0. The inputs and the last result stay when
     the window is closed; the result is cleared when step 7's values change.
@@ -6269,7 +6463,7 @@ class NkFitDialog(QDialog):
     each one, R0 and R60 (step 7) and Si n2, k2 (step 6) come from the table.
     Run does thin_film.fit_nk_spectrum in the background (real progress,
     Cancel) and shows wavelength, n1 and k1 below; they are also added to the
-    Nd and Nk window's table. The result is cleared when step 7 changes.
+    Post Process window's table. The result is cleared when step 7 changes.
     """
 
     # key, label, default (the values in Optical_NK_V7S.py; d1 from the Nd fit)
@@ -6536,7 +6730,7 @@ class NkFitDialog(QDialog):
             f"({wavelengths[0]:.3f}–{wavelengths[-1]:.3f} nm) with d₁ = "
             f"{result['d1']:.4f} nm, n₁ {result['n1_start']:g}–"
             f"{result['n1_start'] + result['n1_range']:g}, k₁ {result['k1_start']:g}–"
-            f"{result['k1_start'] + result['k1_range']:g}. Also in the Nd and Nk "
+            f"{result['k1_start'] + result['k1_range']:g}. Also in the Post Process "
             "window's table (Fitted n1, Fitted k1)."
         )
 
@@ -6596,7 +6790,8 @@ class NkFitDialog(QDialog):
 class SpectrometerAppWithNdNk(SpectrometerApp):
     """Main window with two additions (nothing in the original code changes):
 
-    * an "Nd and Nk" button in the bottom row, right after Post Process;
+    * the Post Process button opens the merged Post Process window (step 1:
+      absolute reflectance, or n1 and k1; T is a placeholder);
     * a big Capture button right beside the Measurement Mode and Optical Data
       buttons, with the "Active context ... traces captured" line to its right
       (see _build_ui below; delete that method to go back to the old layout).
@@ -6674,18 +6869,19 @@ class SpectrometerAppWithNdNk(SpectrometerApp):
         root.insertLayout(0, top)
 
     def _build_controls_row(self) -> QHBoxLayout:
+        """The original Post Process button now opens the merged Post Process
+        window (absolute reflectance, or n1 and k1). The button itself, its
+        place and look are the original ones; only what it opens changes."""
         row = super()._build_controls_row()
-        self._nd_nk_btn = QPushButton("Nd and Nk")
-        self._nd_nk_btn.setObjectName("actionBtn")  # same look as Post Process
-        self._nd_nk_btn.setMinimumHeight(40)  # width: just what its text needs
-        self._nd_nk_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._nd_nk_btn.setToolTip(
-            "Open the Nd and Nk window: absolute reflectance from R₀ and R₆₀, "
-            "and the Nd and Nk thin-film fits"
+        button = self._post_process_btn
+        button.clicked.disconnect()  # was: the original Post Process dialog
+        button.clicked.connect(self._open_nd_nk_window)
+        button.setEnabled(True)
+        button.setToolTip(
+            "Post Process: absolute reflectance (R₀, R₆₀ or both), or n₁ and k₁ "
+            "(R₀ and R₆₀)"
         )
-        self._nd_nk_btn.clicked.connect(self._open_nd_nk_window)
-        index = row.indexOf(self._post_process_btn)
-        row.insertWidget(index + 1 if index >= 0 else row.count(), self._nd_nk_btn)
+        self._nd_nk_btn = button  # older name, kept for the tests and other code
         return row
 
     def _open_nd_nk_window(self) -> None:
@@ -6698,8 +6894,11 @@ class SpectrometerAppWithNdNk(SpectrometerApp):
 
     def _refresh_status(self) -> None:
         super()._refresh_status()
+        # The original enables Post Process only when the selected mode has a
+        # capture; the merged window shows what is missing itself, so keep it on.
+        self._post_process_btn.setEnabled(True)
         # The main window refreshes its status after every capture, import
-        # and reset, so this keeps the Nd and Nk window in step with the data.
+        # and reset, so this keeps the Post Process window in step with the data.
         if self._nd_nk_window is not None:
             self._nd_nk_window.sync_measurements()
 
