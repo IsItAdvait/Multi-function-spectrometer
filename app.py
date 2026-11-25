@@ -6506,6 +6506,15 @@ _NK_SEGMENT_COLORS: tuple[tuple[int, int, int], ...] = (
     (186, 104, 200), (255, 213, 79), (77, 182, 172), (240, 98, 146),
 )
 _NK_RESULT_KEYS = ("n1", "k1", "error", "r0_fit", "r60_fit")
+# Runs list in the Nk Fit window: a tick box per row shows what is on the graph.
+_NK_RUNS_LIST_STYLE = """
+QListWidget#nkRunsList::item { padding: 4px 2px; }
+QListWidget#nkRunsList::indicator {
+    width: 14px; height: 14px; border-radius: 3px;
+    border: 1px solid #5c6370; background-color: #1e2229;
+}
+QListWidget#nkRunsList::indicator:checked { border: 1px solid #4fc3f7; background-color: #4fc3f7; }
+"""
 
 
 def _merge_nk_segments(segments: list[dict[str, object]]) -> dict[str, np.ndarray]:
@@ -6693,6 +6702,11 @@ class NkFitDialog(QDialog):
     ones (Segments); where runs overlap, the smaller error wins. The stored
     result goes into the Post Process table. Runs and the stored result are
     cleared when step 7 changes.
+
+    The graph shows only the latest run (the one in progress, else the newest
+    kept run; with no runs, the stored result). Clicking another run or the
+    stored result in the list shows it alongside, clicking again hides it;
+    each new run starts with a clean graph.
     """
 
     # key, label, default (n1 / k1 values from Optical_NK_V7S.py; d1 from the Nd fit)
@@ -6720,9 +6734,12 @@ class NkFitDialog(QDialog):
         self._paused_plots: list[QWidget] = []
         self._curves: list[object] = []  # segment and stored-result curves
         self._live_curves: list[object] = []
+        # Runs (ids) or "stored" the user clicked to show beside the latest run;
+        # emptied when a new run starts.
+        self._shown_extra: set[object] = set()
         self.setWindowTitle("Nk Fit")
         self.setModal(False)
-        self.setStyleSheet(_ND_NK_STYLE)
+        self.setStyleSheet(_ND_NK_STYLE + _NK_RUNS_LIST_STYLE)
 
         # Left: inputs, Run, runs list, Finish (scrolls on small screens).
         left = QWidget()
@@ -6793,9 +6810,20 @@ class NkFitDialog(QDialog):
 
         runs = QGroupBox("Runs (kept until Finish)")
         runs_layout = QVBoxLayout(runs)
+        runs_layout.addWidget(
+            NdNkWindow._note(
+                "The graph shows the latest run. Click another run (or the stored "
+                "result) to show it alongside; click again to hide it. Each new run "
+                "starts with a clean graph."
+            )
+        )
         self._runs_list = QListWidget()
+        self._runs_list.setObjectName("nkRunsList")
         self._runs_list.setMinimumHeight(120)
         self._runs_list.setWordWrap(True)
+        self._runs_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self._runs_list.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._runs_list.itemClicked.connect(self._on_run_item_clicked)
         runs_layout.addWidget(self._runs_list)
         self._finish_btn = QPushButton("Finish…")
         self._finish_btn.setObjectName("accentBtn")
@@ -7035,6 +7063,10 @@ class NkFitDialog(QDialog):
             "k1_edge": np.full(count, "", dtype=object),
             "done": 0, "dirty": False,
         }
+        # A new run starts with a clean graph: only this run is drawn (earlier
+        # runs can be clicked back on while it runs).
+        self._shown_extra.clear()
+        self._redraw_curves()
         color = _NK_SEGMENT_COLORS[(run_id - 1) % len(_NK_SEGMENT_COLORS)]
         name = f"Run {run_id}: {values['wl_start']:g}–{values['wl_end']:g} nm (running)"
         self._live_curves = [
@@ -7043,6 +7075,8 @@ class NkFitDialog(QDialog):
             self._k_plot.plot([], [], pen=pg.mkPen(color, width=2), symbol="o", symbolSize=5,
                               symbolBrush=pg.mkBrush(*color), symbolPen=None),
         ]
+        for curve in self._live_curves:
+            curve.setZValue(10)  # the latest run is drawn on top
         grid = self._grid()
         self._n_plot.setXRange(float(grid[0]), float(grid[-1]), padding=0.02)
         # While the fit runs, the other plots stop repainting: the main window's
@@ -7162,47 +7196,128 @@ class NkFitDialog(QDialog):
     # Runs list, stored result and plots ----------------------------------
 
     def _redraw_saved(self) -> None:
-        """Plot the finished runs (own colours) and the stored result (white)."""
+        """Rebuild the runs list and redraw the graph."""
+        self._rebuild_runs_list()
+        self._redraw_curves()
+
+    def _fixed_key(self) -> Optional[object]:
+        """What the graph always shows: the newest kept run (or, with no runs,
+        the stored result). None while a run is in progress (that run is the
+        latest, drawn live)."""
+        if self._run is not None:
+            return None
+        segments = self._owner.nk_segments
+        if segments:
+            return segments[-1]["id"]
+        return "stored" if self._owner.nk_fit is not None else None
+
+    def _shown_keys(self) -> set[object]:
+        keys = set(self._shown_extra)
+        fixed = self._fixed_key()
+        if fixed is not None:
+            keys.add(fixed)
+        return keys
+
+    def _rebuild_runs_list(self) -> None:
+        self._runs_list.clear()
+        stored = self._owner.nk_fit
+        if stored is not None:
+            mode = "Complete" if stored["mode"] == "complete" else "Segments"
+            text = (
+                f"Stored result: {int(np.isfinite(np.asarray(stored['n1'])).sum())} "
+                f"wavelengths ({mode})"
+            )
+            item = QListWidgetItem(text)
+            item.setForeground(QColor(*self._STORED_COLOR))
+            item.setData(Qt.ItemDataRole.UserRole, "stored")
+            item.setData(Qt.ItemDataRole.UserRole + 1, text)
+            item.setToolTip("The result stored by the last Finish (it is in the Post Process table).")
+            self._runs_list.addItem(item)
+        for segment in self._owner.nk_segments:
+            color = _NK_SEGMENT_COLORS[(segment["id"] - 1) % len(_NK_SEGMENT_COLORS)]
+            text = _nk_segment_text(segment)
+            edges = _nk_edge_text(segment)
+            if edges:
+                text += "  ⚠"
+            item = QListWidgetItem(text)
+            item.setForeground(QColor(*color))
+            item.setData(Qt.ItemDataRole.UserRole, segment["id"])
+            item.setData(Qt.ItemDataRole.UserRole + 1, text)
+            if edges:
+                item.setToolTip(edges)
+            self._runs_list.addItem(item)
+        for row in range(self._runs_list.count()):
+            item = self._runs_list.item(row)
+            # The tick only shows what is on the graph; clicking the row toggles it.
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+        self._sync_list_checks()
+
+    def _sync_list_checks(self) -> None:
+        shown = self._shown_keys()
+        fixed = self._fixed_key()
+        for row in range(self._runs_list.count()):
+            item = self._runs_list.item(row)
+            key = item.data(Qt.ItemDataRole.UserRole)
+            on = key in shown
+            item.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+            font = item.font()
+            font.setBold(on)
+            item.setFont(font)
+            base = item.data(Qt.ItemDataRole.UserRole + 1)
+            if key == fixed and key != "stored":
+                base += "  · latest"
+            item.setText(base)
+
+    def _on_run_item_clicked(self, item: QListWidgetItem) -> None:
+        """Show a run (or the stored result) beside the latest run, or hide it."""
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if key is None or key == self._fixed_key():
+            return  # the latest run is always on the graph
+        if key in self._shown_extra:
+            self._shown_extra.discard(key)
+        else:
+            self._shown_extra.add(key)
+        self._redraw_curves()
+
+    def _redraw_curves(self) -> None:
+        """Draw the latest run plus the clicked runs (own colours) and, when
+        shown, the stored result (white)."""
         for curve in self._curves:
             for plot in (self._n_plot, self._k_plot):
                 if curve in plot.listDataItems():
                     plot.removeItem(curve)
         self._curves = []
-        self._runs_list.clear()
+        shown = self._shown_keys()
+        fixed = self._fixed_key()
         stored = self._owner.nk_fit
-        if stored is not None:
+        if stored is not None and "stored" in shown:
             pen = pg.mkPen(self._STORED_COLOR, width=2)
             for plot, key, name in ((self._n_plot, "n1", "Stored result"), (self._k_plot, "k1", None)):
                 values = np.asarray(stored[key])
                 ok = np.isfinite(values)
-                self._curves.append(
-                    plot.plot(np.asarray(stored["wavelength"])[ok], values[ok], pen=pen,
-                              symbol="o", symbolSize=4, symbolBrush=pg.mkBrush(*self._STORED_COLOR),
-                              symbolPen=None, name=name)
-                )
+                curve = plot.plot(np.asarray(stored["wavelength"])[ok], values[ok], pen=pen,
+                                  symbol="o", symbolSize=4, symbolBrush=pg.mkBrush(*self._STORED_COLOR),
+                                  symbolPen=None, name=name)
+                curve.setZValue(10 if fixed == "stored" else 0)
+                self._curves.append(curve)
         for segment in self._owner.nk_segments:
+            if segment["id"] not in shown:
+                continue
             color = _NK_SEGMENT_COLORS[(segment["id"] - 1) % len(_NK_SEGMENT_COLORS)]
-            for plot, key, name in (
-                (self._n_plot, "n1", f"Run {segment['id']}: {segment['start']:g}–{segment['end']:g} nm"),
-                (self._k_plot, "k1", None),
-            ):
+            latest = segment["id"] == fixed
+            label = f"Run {segment['id']}: {segment['start']:g}–{segment['end']:g} nm" + (" (latest)" if latest else "")
+            for plot, key, name in ((self._n_plot, "n1", label), (self._k_plot, "k1", None)):
                 values = np.asarray(segment[key])
                 ok = np.isfinite(values)
-                self._curves.append(
-                    plot.plot(np.asarray(segment["wavelength"])[ok], values[ok],
-                              pen=pg.mkPen(color, width=2), symbol="o", symbolSize=4,
-                              symbolBrush=pg.mkBrush(*color), symbolPen=None, name=name)
-                )
-            item = QListWidgetItem(_nk_segment_text(segment))
-            item.setForeground(QColor(*color))
-            edges = _nk_edge_text(segment)
-            if edges:
-                item.setText(item.text() + "  ⚠")
-                item.setToolTip(edges)
-            self._runs_list.addItem(item)
+                curve = plot.plot(np.asarray(segment["wavelength"])[ok], values[ok],
+                                  pen=pg.mkPen(color, width=2), symbol="o", symbolSize=4,
+                                  symbolBrush=pg.mkBrush(*color), symbolPen=None, name=name)
+                curve.setZValue(10 if latest else 0)
+                self._curves.append(curve)
         grid = self._grid()
         if grid is not None:
             self._n_plot.setXRange(float(grid[0]), float(grid[-1]), padding=0.02)
+        self._sync_list_checks()
 
     def _on_finish_clicked(self) -> None:
         segments = list(self._owner.nk_segments)
@@ -7227,6 +7342,7 @@ class NkFitDialog(QDialog):
         owner = self._owner
         owner.nk_fit = merged
         owner.nk_segments = []
+        self._shown_extra.clear()
         owner._refresh_table()
         fitted = int(np.isfinite(merged["n1"]).sum())
         owner._summary.setText(
@@ -7244,6 +7360,7 @@ class NkFitDialog(QDialog):
             self._thread.stop_requested = True
             if self._run is not None:
                 self._run["discard"] = True
+        self._shown_extra.clear()
         self._redraw_saved()
         self._progress_bar.setValue(0)
         self._progress_label.setText(
