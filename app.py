@@ -6594,14 +6594,84 @@ class NkFitDialog(QDialog):
 
 
 class SpectrometerAppWithNdNk(SpectrometerApp):
-    """Main window plus an "Nd and Nk" button at the right end of the top row.
+    """Main window with two additions (nothing in the original code changes):
 
-    The button sits in the bottom row, right after Post Process (it is added to
-    the row the original code builds; nothing in that code changes).
+    * an "Nd and Nk" button in the bottom row, right after Post Process;
+    * a big Capture button right beside the Measurement Mode and Optical Data
+      buttons, with the "Active context ... traces captured" line to its right
+      (see _build_ui below; delete that method to go back to the old layout).
     """
 
     # Created the first time the button is pressed, then kept (remembering).
     _nd_nk_window: Optional[NdNkWindow] = None
+
+    _BIG_CAPTURE_STYLE = """
+        QPushButton {
+            background-color: #0f5563; color: #ffffff; font-size: 19px; font-weight: 700;
+            border: 2px solid #00bcd4; border-radius: 8px; padding: 8px 22px;
+        }
+        QPushButton:hover { background-color: #137083; }
+        QPushButton:pressed { background-color: #0b3f4a; }
+        QPushButton:disabled {
+            background-color: #1e2229; color: #6b7280; border: 1px solid #2a2f3a;
+        }
+    """
+
+    def _build_ui(self) -> None:
+        """Build the original window, then move the Capture button and the
+        "traces captured" line next to the mode / trace buttons.
+
+        Before: [mode row .......... traces captured]
+                [trace row ........................ Capture]
+        After:  [mode row ]  [  big    ]  traces captured
+                [trace row]  [ Capture ]
+        The same widgets (the original code still updates their text); only
+        their place, and the Capture button's size and look, change.
+        """
+        super()._build_ui()
+        root = self.centralWidget().layout()
+        mode_row = root.itemAt(0).layout()
+        trace_row = root.itemAt(1).layout()
+        if (
+            mode_row is None
+            or trace_row is None
+            or mode_row.indexOf(self._geometry_hint) < 0
+            or trace_row.indexOf(self._capture_btn) < 0
+        ):
+            return  # layout not as expected: leave the original one
+        root.takeAt(0)
+        root.takeAt(0)
+        mode_row.removeWidget(self._geometry_hint)
+        mode_row.addStretch(1)  # R0 / R60 / T keep their original size
+        trace_row.removeWidget(self._capture_btn)
+
+        buttons = QVBoxLayout()
+        buttons.setSpacing(10)
+        buttons.addLayout(mode_row)
+        buttons.addLayout(trace_row)
+
+        capture = self._capture_btn
+        capture.setStyleSheet(self._BIG_CAPTURE_STYLE)
+        capture.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        # Wide enough for the longest text, so the button never changes size.
+        current = capture.text()
+        widest = 0
+        for verb in ("Capture", "Recapture"):
+            for mode in CaptureMode:
+                for _key, display in OPTICAL_MODES:
+                    capture.setText(f"{verb} {mode.value} ({display})")
+                    capture.ensurePolished()
+                    widest = max(widest, capture.sizeHint().width())
+        capture.setText(current)
+        capture.setMinimumSize(max(320, widest), 86)
+
+        top = QHBoxLayout()
+        top.setSpacing(16)
+        top.addLayout(buttons)
+        top.addWidget(capture)
+        top.addWidget(self._geometry_hint)
+        top.addStretch(1)
+        root.insertLayout(0, top)
 
     def _build_controls_row(self) -> QHBoxLayout:
         row = super()._build_controls_row()
