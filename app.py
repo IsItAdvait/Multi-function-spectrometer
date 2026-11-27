@@ -4001,18 +4001,21 @@ class SpectrometerApp(QMainWindow):
 # Step 1 chooses what to calculate:
 #   * Absolute reflectance: R0, R60 or both (any mode with Baseline, Standard
 #     and Sample), steps 1-8;
-#   * n1 and k1: needs R0 and R60, steps 1-10;
+#   * n1 and k1: needs R0 and R60, steps 1-11;
 #   * T (transmission): placeholder button, disabled, nothing behind it yet.
 # Workflow (one numbered step per button, in this order):
 #   1 What to calculate + measurements (main-window captures, or Import
 #     Measurement File here)                             2 Average
 #   3 Relative reflectance   4 Interpolate reflectance   5 Import Si values
-#   6 Interpolate Si values  7 Absolute reflectance      8 Plot (Graph tab)
+#   6 Interpolate Si values  7 Absolute reflectance
+#   8 Plot ("Absolute Reflectance vs Wavelength" tab)
 #   9 Nd fit: opens the Nd Fit window (n1 and d1 at one wavelength, the search
 #     of Optical_Nd_V7S.py with pi; see thin_film.fit_nd)
 #  10 Nk fit: opens the Nk Fit window (n1 and k1 at every interpolated
 #     wavelength with d1 fixed, the search of Optical_NK_V7S.py with pi; see
 #     thin_film.fit_nk_spectrum). Results go into the table.
+#  11 Plot n1 and k1 ("n1 and k1 vs Wavelength" tab: both on the same axis).
+# Excel export: one chart sheet per graph tab (each when its data exists).
 # Step 7's bare-Si reflectance follows the lab's Excel sheet exactly
 # (thin_film.si_wafer_reflectance_excel).
 # The table shows every step's output. Redoing a step clears the steps after
@@ -4348,11 +4351,22 @@ def _xlsx_num_ref(formula: str, values: np.ndarray) -> str:
 
 
 def _xlsx_chart(chart: dict[str, object]) -> str:
-    """A scatter chart with straight lines: one series per curve."""
+    """A scatter chart with straight lines: one series per curve. Series with
+    "secondary": True go on a second y axis on the right (title y2_title)."""
     series_xml = []
-    for index, series in enumerate(chart["series"]):
+    secondary_xml = []
+    # Excel lists primary-axis series first in the legend: number them that way.
+    ordered = [s for s in chart["series"] if not s.get("secondary")] + [
+        s for s in chart["series"] if s.get("secondary")
+    ]
+    hidden_entries = "".join(
+        f'<c:legendEntry><c:idx val="{i}"/><c:delete val="1"/></c:legendEntry>'
+        for i, s in enumerate(ordered)
+        if not s.get("legend", True)
+    )
+    for index, series in enumerate(ordered):
         dash = '<a:prstDash val="dash"/>' if series["dashed"] else ""
-        series_xml.append(
+        (secondary_xml if series.get("secondary") else series_xml).append(
             f'<c:ser><c:idx val="{index}"/><c:order val="{index}"/>'
             f"<c:tx><c:v>{_xlsx_text(series['name'])}</c:v></c:tx>"
             f'<c:spPr><a:ln w="19050" cap="rnd"><a:solidFill><a:srgbClr val="{series["color"]}"/>'
@@ -4363,35 +4377,57 @@ def _xlsx_chart(chart: dict[str, object]) -> str:
             '<c:smooth val="0"/></c:ser>'
         )
 
-    def axis(ax_id: int, cross_id: int, position: str, title: str, limits: str) -> str:
+    def axis(ax_id: int, cross_id: int, position: str, title: str, limits: str,
+             deleted: bool = False, gridlines: bool = True, crosses: str = "autoZero") -> str:
         return (
             f'<c:valAx><c:axId val="{ax_id}"/><c:scaling><c:orientation val="minMax"/>{limits}'
-            f'</c:scaling><c:delete val="0"/><c:axPos val="{position}"/><c:majorGridlines>'
-            '<c:spPr><a:ln w="6350"><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln>'
-            f"</c:spPr></c:majorGridlines>{_xlsx_rich_title(title, 1000)}"
-            '<c:numFmt formatCode="General" sourceLinked="0"/><c:majorTickMark val="out"/>'
+            f'</c:scaling><c:delete val="{1 if deleted else 0}"/><c:axPos val="{position}"/>'
+            + (
+                '<c:majorGridlines><c:spPr><a:ln w="6350"><a:solidFill><a:srgbClr val="D9D9D9"/>'
+                "</a:solidFill></a:ln></c:spPr></c:majorGridlines>"
+                if gridlines else ""
+            )
+            + (_xlsx_rich_title(title, 1000) if title else "")
+            + '<c:numFmt formatCode="General" sourceLinked="0"/><c:majorTickMark val="out"/>'
             '<c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/>'
-            f'<c:crossAx val="{cross_id}"/><c:crosses val="autoZero"/>'
+            f'<c:crossAx val="{cross_id}"/><c:crosses val="{crosses}"/>'
             '<c:crossBetween val="midCat"/></c:valAx>'
         )
 
     x_limits = f'<c:max val="{chart["x_max"]!r}"/><c:min val="{chart["x_min"]!r}"/>'
+    two_axes = bool(secondary_xml)
+    # With a right-hand axis the plot is narrower so its labels don't hit the legend.
+    plot_w, legend_x, legend_w = ("0.5", "0.74", "0.25") if two_axes else ("0.56", "0.69", "0.3")
+    second = (
+        '<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>'
+        + "".join(secondary_xml)
+        + '<c:axId val="500000003"/><c:axId val="500000004"/></c:scatterChart>'
+        if two_axes else ""
+    )
+    second_axes = (
+        axis(500000003, 500000004, "b", "", x_limits, deleted=True, gridlines=False)
+        + axis(500000004, 500000003, "r", chart.get("y2_title", ""), "", gridlines=False,
+               crosses="max")
+        if two_axes else ""
+    )
     return (
         f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         f'<c:chartSpace xmlns:c="{_XLSX_C_NS}" xmlns:a="{_XLSX_A_NS}" xmlns:r="{_XLSX_REL_NS}">'
         '<c:roundedCorners val="0"/><c:chart>'
         f'{_xlsx_rich_title(chart["title"], 1100)}<c:autoTitleDeleted val="0"/><c:plotArea>'
         '<c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/>'
-        '<c:yMode val="edge"/><c:x val="0.1"/><c:y val="0.12"/><c:w val="0.56"/>'
+        f'<c:yMode val="edge"/><c:x val="0.1"/><c:y val="0.12"/><c:w val="{plot_w}"/>'
         '<c:h val="0.7"/></c:manualLayout></c:layout>'
         '<c:scatterChart><c:scatterStyle val="lineMarker"/><c:varyColors val="0"/>'
         + "".join(series_xml)
         + '<c:axId val="500000001"/><c:axId val="500000002"/></c:scatterChart>'
+        + second
         + axis(500000001, 500000002, "b", chart["x_title"], x_limits)
         + axis(500000002, 500000001, "l", chart["y_title"], "")
-        + '</c:plotArea><c:legend><c:legendPos val="r"/><c:layout><c:manualLayout>'
-        '<c:xMode val="edge"/><c:yMode val="edge"/><c:x val="0.69"/><c:y val="0.12"/>'
-        '<c:w val="0.3"/><c:h val="0.3"/></c:manualLayout></c:layout><c:overlay val="0"/>'
+        + second_axes
+        + '</c:plotArea><c:legend><c:legendPos val="r"/>' + hidden_entries + '<c:layout><c:manualLayout>'
+        f'<c:xMode val="edge"/><c:yMode val="edge"/><c:x val="{legend_x}"/><c:y val="0.12"/>'
+        f'<c:w val="{legend_w}"/><c:h val="0.3"/></c:manualLayout></c:layout><c:overlay val="0"/>'
         '<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900"/></a:pPr>'
         '<a:endParaRPr lang="en-US"/></a:p></c:txPr></c:legend>'
         '<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>'
@@ -4401,16 +4437,23 @@ def _xlsx_chart(chart: dict[str, object]) -> str:
 def _write_results_workbook(
     path: Path,
     data_columns: list[tuple[str, np.ndarray]],
-    chart: Optional[dict[str, object]],
+    charts: object,
     info_rows: list[tuple[object, object, bool]],
 ) -> None:
-    """Write the .xlsx: sheet "Data" (the table), "Graph" (the chart, if any)
-    and "Settings and fits" (label / value rows; the bool marks bold rows).
+    """Write the .xlsx: sheet "Data" (the table), one sheet per chart and
+    "Settings and fits" (label / value rows; the bool marks bold rows).
 
-    ``chart``: title, x_title, y_title, x_min, x_max and series (name, x_column,
+    ``charts``: a list of (sheet name, chart), or one chart / None (sheet
+    "Graph"). A chart has title, x_title, y_title (y2_title for a right-hand
+    axis), x_min, x_max, an optional "note" and series (name, x_column,
     y_column = indexes into data_columns, length = number of points, color,
-    dashed). The chart's series point at the Data sheet, so it follows edits.
+    dashed, optional secondary). The series point at the Data sheet, so the
+    charts follow edits.
     """
+    if charts is None:
+        charts = []
+    elif isinstance(charts, dict):
+        charts = [("Graph", charts)]
     # Data sheet
     headers = [header for header, _values in data_columns]
     arrays = [np.asarray(values, dtype=np.float64).ravel() for _header, values in data_columns]
@@ -4429,27 +4472,31 @@ def _write_results_workbook(
     widths = [min(42.0, max(12.0, len(h) * 1.05 + 2)) for h in headers]
     sheets = [("Data", _xlsx_sheet(rows, widths, freeze_header=True))]
 
-    # Graph sheet
-    chart_xml = None
-    if chart is not None:
+    # Chart sheets
+    chart_parts: list[tuple[str, str]] = []  # (sheet name, chart xml)
+    for sheet_name, chart in charts:
         series = []
         for s in chart["series"]:
             x_col, y_col, n = s["x_column"], s["y_column"], s["length"]
+            first = int(s.get("first", 0))  # first data row of the series (0 = row 2)
+            top, bottom = first + 2, first + n + 1
             series.append(
                 {
                     "name": s["name"], "color": s["color"], "dashed": s["dashed"],
-                    "x_ref": f"'Data'!${letters[x_col]}$2:${letters[x_col]}${n + 1}",
-                    "y_ref": f"'Data'!${letters[y_col]}$2:${letters[y_col]}${n + 1}",
-                    "x": arrays[x_col][:n], "y": arrays[y_col][:n],
+                    "secondary": s.get("secondary", False),
+                    "legend": s.get("legend", True),
+                    "x_ref": f"'Data'!${letters[x_col]}${top}:${letters[x_col]}${bottom}",
+                    "y_ref": f"'Data'!${letters[y_col]}${top}:${letters[y_col]}${bottom}",
+                    "x": arrays[x_col][first:first + n], "y": arrays[y_col][first:first + n],
                 }
             )
-        chart_xml = _xlsx_chart({**chart, "series": series})
+        chart_parts.append((sheet_name, _xlsx_chart({**chart, "series": series})))
         note = _xlsx_cell(
             "A1",
-            "Drawn from the Data sheet: the same curves as the app's Graph tab.",
+            chart.get("note", "Drawn from the Data sheet: the same curves as the app's Graph tab."),
         )
         sheets.append(
-            ("Graph", _xlsx_sheet([f'<row r="1">{note}</row>'], [], False, drawing=True))
+            (sheet_name, _xlsx_sheet([f'<row r="1">{note}</row>'], [], False, drawing=True))
         )
 
     # Settings and fits sheet
@@ -4478,11 +4525,11 @@ def _write_results_workbook(
         'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
         for i in range(len(sheets))
     )
-    if chart_xml is not None:
+    for k in range(1, len(chart_parts) + 1):
         overrides += (
-            '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/'
+            f'<Override PartName="/xl/drawings/drawing{k}.xml" ContentType="application/'
             'vnd.openxmlformats-officedocument.drawing+xml"/>'
-            '<Override PartName="/xl/charts/chart1.xml" ContentType="application/'
+            f'<Override PartName="/xl/charts/chart{k}.xml" ContentType="application/'
             'vnd.openxmlformats-officedocument.drawingml.chart+xml"/>'
         )
     header = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -4534,35 +4581,45 @@ def _write_results_workbook(
     }
     for i, (_name, xml) in enumerate(sheets):
         parts[f"xl/worksheets/sheet{i + 1}.xml"] = xml
-    if chart_xml is not None:
-        graph_index = [name for name, _xml in sheets].index("Graph") + 1
+    sheet_names = [name for name, _xml in sheets]
+    for k, (sheet_name, chart_xml) in enumerate(chart_parts, start=1):
+        graph_index = sheet_names.index(sheet_name) + 1
         parts[f"xl/worksheets/_rels/sheet{graph_index}.xml.rels"] = (
             f'{header}<Relationships xmlns="{_XLSX_PKG_REL_NS}"><Relationship Id="rId1" '
-            f'Type="{_XLSX_REL_NS}/drawing" Target="../drawings/drawing1.xml"/></Relationships>'
+            f'Type="{_XLSX_REL_NS}/drawing" Target="../drawings/drawing{k}.xml"/></Relationships>'
         )
-        parts["xl/drawings/drawing1.xml"] = (
+        parts[f"xl/drawings/drawing{k}.xml"] = (
             f'{header}<xdr:wsDr xmlns:xdr="{_XLSX_XDR_NS}" xmlns:a="{_XLSX_A_NS}">'
             # 6.3 x 4.3 inches from cell A3: fits a printed A4 or Letter page.
             '<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:colOff>0</xdr:colOff>'
             '<xdr:row>2</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>'
             '<xdr:ext cx="5760720" cy="3931920"/><xdr:graphicFrame macro="">'
-            '<xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Reflectance chart"/>'
+            f'<xdr:nvGraphicFramePr><xdr:cNvPr id="{k + 1}" name="Chart {k}"/>'
             '<xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/>'
             '<a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.'
             f'openxmlformats.org/drawingml/2006/chart"><c:chart xmlns:c="{_XLSX_C_NS}" '
             f'xmlns:r="{_XLSX_REL_NS}" r:id="rId1"/></a:graphicData></a:graphic>'
             "</xdr:graphicFrame><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"
         )
-        parts["xl/drawings/_rels/drawing1.xml.rels"] = (
+        parts[f"xl/drawings/_rels/drawing{k}.xml.rels"] = (
             f'{header}<Relationships xmlns="{_XLSX_PKG_REL_NS}"><Relationship Id="rId1" '
-            f'Type="{_XLSX_REL_NS}/chart" Target="../charts/chart1.xml"/></Relationships>'
+            f'Type="{_XLSX_REL_NS}/chart" Target="../charts/chart{k}.xml"/></Relationships>'
         )
-        parts["xl/charts/chart1.xml"] = chart_xml
+        parts[f"xl/charts/chart{k}.xml"] = chart_xml
     temp = path.with_name(path.name + ".part")
     with _zipfile.ZipFile(temp, "w", _zipfile.ZIP_DEFLATED) as archive:
         for name, xml in parts.items():
             archive.writestr(name, xml.encode("utf-8"))
     temp.replace(path)  # only replace an existing file once the new one is complete
+
+
+# Graph tabs of the Post Process window and their sheets in the Excel export
+# (sheet names: at most 31 characters).
+_ABS_GRAPH_TAB = "Absolute Reflectance vs Wavelength"
+_NK_GRAPH_TAB = "n₁ and k₁ vs Wavelength"
+_ABS_GRAPH_SHEET = "Abs Reflectance vs Wavelength"
+_NK_GRAPH_SHEET = "n1 and k1 vs Wavelength"
+_NK_PLOT_COLORS = {"n1": (100, 181, 246), "k1": (255, 138, 101)}  # blue, deep orange
 
 
 def _show_maximized(window: QWidget) -> None:
@@ -4623,6 +4680,9 @@ class NdNkWindow(QDialog):
         self.nk_run_counter = 0
         self.nk_fit: Optional[dict[str, object]] = None
         self._nk_fit_dialog: Optional["NkFitDialog"] = None
+        # Step 11: the stored n1, k1 plotted (cleared whenever the stored result changes).
+        self.nk_plotted = False
+        self._nk_plot_curves: list[object] = []
         # The measurement arrays the results were calculated from.
         self._results_inputs: Optional[tuple[Optional[np.ndarray], ...]] = None
         # The measurement arrays currently shown in the table.
@@ -4667,7 +4727,7 @@ class NdNkWindow(QDialog):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 4, 0)
         layout.setSpacing(10)
-        self._step_groups: list[QGroupBox] = []  # steps 1..10, in order
+        self._step_groups: list[QGroupBox] = []  # steps 1..11, in order
         for build in (
             self._build_measurements_group,
             self._build_average_group,
@@ -4679,11 +4739,12 @@ class NdNkWindow(QDialog):
             self._build_plot_group,
             self._build_nd_fit_group,
             self._build_nk_fit_group,
+            self._build_nk_plot_group,
         ):
             group = build()
-            # Fixed height: when the steps are taller than the window the sidebar
-            # scrolls, instead of squeezing a box and hiding its last lines.
-            group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+            # Never shorter than its text needs (the sidebar scrolls instead of
+            # squeezing a box), and it grows when a footnote gets longer.
+            group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
             self._step_groups.append(group)
             layout.addWidget(group)
         layout.addStretch(1)
@@ -4753,7 +4814,7 @@ class NdNkWindow(QDialog):
     _CALCULATIONS = (
         # key, button text, note under it
         ("absolute", "Absolute reflectance", "R₀, R₆₀ or both · steps 1–8"),
-        ("nk", "n₁ and k₁", "needs R₀ and R₆₀ · steps 1–10"),
+        ("nk", "n₁ and k₁", "needs R₀ and R₆₀ · steps 1–11"),
         ("t", "T (transmission)", "placeholder, not set up yet"),
     )
 
@@ -4976,6 +5037,26 @@ class NdNkWindow(QDialog):
         )
         return group
 
+    def _build_nk_plot_group(self) -> QGroupBox:
+        group = QGroupBox("11 · Plot n₁ and k₁")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+        self._plot_nk_btn = QPushButton("Plot n₁ and k₁")
+        self._plot_nk_btn.setObjectName("accentBtn")
+        self._plot_nk_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._plot_nk_btn.clicked.connect(self._on_plot_nk_clicked)
+        layout.addWidget(self._plot_nk_btn)
+        self._plot_nk_footnote = self._footnote()
+        layout.addWidget(self._plot_nk_footnote)
+        layout.addWidget(
+            self._note(
+                "Plots the stored n₁ and k₁ from step 10 against wavelength in one "
+                "graph, on the same axis. Click a legend entry to hide or show that "
+                "curve."
+            )
+        )
+        return group
+
     def _on_si_same_grid_toggled(self, checked: bool) -> None:
         for edit in (self._si_start, self._si_end, self._si_step):
             edit.setEnabled(not checked)
@@ -5054,17 +5135,58 @@ class NdNkWindow(QDialog):
         self._export_graph_tab_btn.clicked.connect(self._export_csv)
         graph_bar.addWidget(self._export_graph_tab_btn)
         graph_layout.addLayout(graph_bar)
-        self._results_tabs.addTab(graph_page, "Graph")
+        self._results_tabs.addTab(graph_page, _ABS_GRAPH_TAB)
+        self._results_tabs.addTab(self._build_nk_graph_page(), _NK_GRAPH_TAB)
         return self._results_tabs
+
+    def _build_nk_graph_page(self) -> QWidget:
+        """Step 11's tab: n1 and k1 vs wavelength on the same axis."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        self._nk_plot_widget = pg.PlotWidget()
+        item = self._nk_plot_widget.getPlotItem()
+        for axis in ("left", "bottom"):
+            item.getAxis(axis).enableAutoSIPrefix(False)
+        item.setLabel("bottom", "Wavelength (nm)")
+        item.setLabel("left", "n₁ and k₁")
+        item.showGrid(x=True, y=True, alpha=0.25)
+        item.setTitle("n₁ and k₁ vs wavelength")
+        self._nk_plot_legend = item.addLegend(
+            offset=(-10, 10),
+            brush=pg.mkBrush(26, 29, 35, 230),
+            pen=pg.mkPen(80, 86, 96),
+        )
+        self._nk_plot_legend.setZValue(20)
+        layout.addWidget(self._nk_plot_widget, stretch=1)
+        bar = QHBoxLayout()
+        self._save_nk_graph_footnote = self._footnote()
+        bar.addWidget(self._save_nk_graph_footnote, stretch=1)
+        self._save_nk_graph_btn = QPushButton("Save Graph Image")
+        self._save_nk_graph_btn.setObjectName("accentBtn")
+        self._save_nk_graph_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._save_nk_graph_btn.clicked.connect(self._save_nk_graph_image)
+        bar.addWidget(self._save_nk_graph_btn)
+        self._export_nk_graph_tab_btn = QPushButton("Export (Excel or CSV)")
+        self._export_nk_graph_tab_btn.setObjectName("accentBtn")
+        self._export_nk_graph_tab_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._export_nk_graph_tab_btn.setToolTip(self._export_btn.toolTip())
+        self._export_nk_graph_tab_btn.clicked.connect(self._export_csv)
+        bar.addWidget(self._export_nk_graph_tab_btn)
+        layout.addLayout(bar)
+        return page
+
+
 
     # ------------------------------------------------------------------
     # Requirements (footnotes and pop-ups)
     # ------------------------------------------------------------------
 
     def _set_calculation(self, key: str) -> None:
-        """Step 1 choice: show steps 2-8 (absolute) or 2-10 (n1 and k1).
+        """Step 1 choice: show steps 2-8 (absolute) or 2-11 (n1 and k1).
 
-        Results are kept when switching; steps 9 and 10 are only hidden.
+        Results are kept when switching; steps 9-11 are only hidden.
         """
         self.calculation = key
         self._calc_buttons[key].setChecked(True)
@@ -5074,9 +5196,12 @@ class NdNkWindow(QDialog):
             self._refresh_table()
 
     def _apply_calculation_visibility(self) -> None:
-        last_step = {None: 1, "absolute": 8, "nk": 10}[self.calculation]
+        last_step = {None: 1, "absolute": 8, "nk": 11}[self.calculation]
         for number, group in enumerate(self._step_groups, start=1):
             group.setVisible(number <= last_step)
+        # The n1 / k1 graph tab belongs to the n1 and k1 calculation only.
+        nk_tab = self._results_tabs.indexOf(self._nk_plot_widget.parentWidget())
+        self._results_tabs.setTabVisible(nk_tab, self.calculation == "nk")
 
     def _missing_measurements(self, modes: Optional[tuple[str, ...]] = None) -> list[str]:
         modes = modes or tuple(mode for mode, _angle in _ND_NK_MODES)
@@ -5236,6 +5361,15 @@ class NdNkWindow(QDialog):
         elif step == "save_graph":
             if not self.plotted:
                 needed.append("A plotted graph (step 8: Plot Absolute Reflectance)")
+        elif step == "plot_nk":
+            if self.nk_fit is None:
+                needed.append(
+                    "Stored n₁ and k₁ (step 10: run the Nk fit, then press Finish in "
+                    "the Nk Fit window)"
+                )
+        elif step == "save_nk_graph":
+            if not self.nk_plotted:
+                needed.append("A plotted graph (step 11: Plot n₁ and k₁)")
         elif step == "export":
             if self._model.columnCount() == 0:
                 needed.append("Something to export: measurements, or imported Si values")
@@ -5338,7 +5472,7 @@ class NdNkWindow(QDialog):
         self._set_footnote(
             self._plot_footnote,
             self._requirements("plot"),
-            "Plotted (see the Graph tab). Press again to redraw."
+            f"Plotted (see the {_ABS_GRAPH_TAB} tab). Press again to redraw."
             if self.plotted
             else "Ready to plot.",
         )
@@ -5366,7 +5500,17 @@ class NdNkWindow(QDialog):
         self._set_footnote(self._nk_fit_footnote, self._requirements("nk_fit"), nk_text)
         if self._nk_fit_dialog is not None:
             self._nk_fit_dialog.refresh()
+        self._set_footnote(
+            self._plot_nk_footnote,
+            self._requirements("plot_nk"),
+            f"Plotted (see the {_NK_GRAPH_TAB} tab). Press again to redraw."
+            if self.nk_plotted
+            else "Ready to plot.",
+        )
         self._set_footnote(self._save_graph_footnote, self._requirements("save_graph"), "")
+        self._set_footnote(
+            self._save_nk_graph_footnote, self._requirements("save_nk_graph"), ""
+        )
         export_needed = self._requirements("export")
         if export_needed:
             self._set_footnote(self._export_footnote, export_needed, "")
@@ -5480,6 +5624,7 @@ class NdNkWindow(QDialog):
             )
             self.nk_fit = None  # so did the Nk runs and their stored result
             self.nk_segments = []
+            self._clear_nk_plot()
             if self._nk_fit_dialog is not None:
                 self._nk_fit_dialog.results_cleared(had_nk)
         self.plotted = False
@@ -5501,6 +5646,7 @@ class NdNkWindow(QDialog):
         (also one in progress) and its stored result are cleared."""
         self.nk_fit = None
         self.nk_segments = []
+        self._clear_nk_plot()
         if self._nk_fit_dialog is not None:
             self._nk_fit_dialog.results_cleared(
                 True,
@@ -5682,7 +5828,7 @@ class NdNkWindow(QDialog):
         )
 
     def _on_plot_clicked(self) -> None:
-        """Step 8: plot absolute reflectance vs wavelength (Graph tab)."""
+        """Step 8: plot absolute reflectance vs wavelength (its graph tab)."""
         needed = self._requirements("plot")
         if needed:
             self._show_requirements_popup("Not Ready Yet", needed)
@@ -5715,7 +5861,7 @@ class NdNkWindow(QDialog):
         self._results_tabs.setCurrentIndex(1)
         self._update_footnotes()
         self._summary.setText(
-            "Absolute reflectance and bare-Si reflectance plotted (Graph tab)."
+            f"Absolute reflectance and bare-Si reflectance plotted ({_ABS_GRAPH_TAB} tab)."
         )
 
     def _refit_plot(self) -> None:
@@ -5723,6 +5869,89 @@ class NdNkWindow(QDialog):
         view = self._plot_widget.getViewBox()
         view.enableAutoRange()
         view.updateAutoRange()
+
+    def _clear_nk_plot(self) -> None:
+        """Remove step 11's curves (the stored n1 / k1 changed or was cleared)."""
+        item = self._nk_plot_widget.getPlotItem()
+        for curve in self._nk_plot_curves:
+            self._nk_plot_legend.removeItem(curve)
+            item.removeItem(curve)
+        self._nk_plot_curves = []
+        self.nk_plotted = False
+
+    @staticmethod
+    def _with_gaps(wavelengths: np.ndarray, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Drop missing values and break the line where wavelengths are missing
+        (runs kept as separate segments), so no line is drawn across a gap."""
+        ok = np.isfinite(values) & np.isfinite(wavelengths)
+        x = np.asarray(wavelengths, dtype=np.float64)[ok]
+        y = np.asarray(values, dtype=np.float64)[ok]
+        if x.size < 3:
+            return x, y
+        steps = np.diff(x)
+        breaks = np.flatnonzero(steps > 1.5 * float(np.median(steps)))
+        if breaks.size:
+            x = np.insert(x, breaks + 1, np.nan)
+            y = np.insert(y, breaks + 1, np.nan)
+        return x, y
+
+    def _on_plot_nk_clicked(self) -> None:
+        """Step 11: plot the stored n1 and k1 vs wavelength (n1 / k1 tab)."""
+        needed = self._requirements("plot_nk")
+        if needed:
+            self._show_requirements_popup("Not Ready Yet", needed)
+            return
+        self._clear_nk_plot()
+        item = self._nk_plot_widget.getPlotItem()
+        fit = self.nk_fit
+        wavelengths = np.asarray(fit["wavelength"], dtype=np.float64)
+        for key, name in (("n1", "n₁"), ("k1", "k₁")):
+            x, y = self._with_gaps(wavelengths, np.asarray(fit[key], dtype=np.float64))
+            curve = pg.PlotDataItem(
+                x, y, pen=pg.mkPen(color=_NK_PLOT_COLORS[key], width=2), connect="finite"
+            )
+            item.addItem(curve)  # (no name: the legend entry is added below)
+            self._nk_plot_legend.addItem(curve, name)
+            # Refit the axes when a curve is hidden or shown from the legend.
+            curve.visibleChanged.connect(self._refit_nk_plot)
+            self._nk_plot_curves.append(curve)
+        self._refit_nk_plot()
+        self.nk_plotted = True
+        self._results_tabs.setCurrentIndex(
+            self._results_tabs.indexOf(self._nk_plot_widget.parentWidget())
+        )
+        self._update_footnotes()
+        self._summary.setText(f"n₁ and k₁ plotted ({_NK_GRAPH_TAB} tab).")
+
+    def _refit_nk_plot(self) -> None:
+        """Fit the axes to the visible curves (after a legend click)."""
+        view = self._nk_plot_widget.getPlotItem().vb
+        view.enableAutoRange()
+        view.updateAutoRange()
+
+    def _save_nk_graph_image(self) -> None:
+        needed = self._requirements("save_nk_graph")
+        if needed:
+            self._show_requirements_popup("Nothing to Save", needed)
+            return
+        default_name = f"n1_k1_vs_wavelength_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        path_str, selected = QFileDialog.getSaveFileName(
+            self,
+            "Save Graph Image",
+            str(Path.home() / default_name),
+            "PNG Image (*.png);;JPEG Image (*.jpg *.jpeg)",
+        )
+        if not path_str:
+            return
+        path = Path(path_str)
+        if path.suffix.lower() not in (".png", ".jpg", ".jpeg"):
+            path = path.with_suffix(".jpg" if "JPEG" in (selected or "") else ".png")
+        try:
+            ImageExporter(self._nk_plot_widget.plotItem).export(str(path))
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Failed", str(exc))
+            return
+        QMessageBox.information(self, "Graph Saved", f"Saved graph image to:\n{path}")
 
     def _save_graph_image(self) -> None:
         needed = self._requirements("save_graph")
@@ -6071,11 +6300,17 @@ class NdNkWindow(QDialog):
                 message = f"Saved the table ({len(rows)} rows) to:\n{path}"
             else:
                 columns = list(self._model._columns)
+                charts = []
                 chart = self._export_chart_spec(columns)
-                _write_results_workbook(path, columns, chart, self._export_info_rows())
+                if chart is not None:
+                    charts.append((_ABS_GRAPH_SHEET, chart))
+                nk_chart = self._export_nk_chart_spec(columns)
+                if nk_chart is not None:
+                    charts.append((_NK_GRAPH_SHEET, nk_chart))
+                _write_results_workbook(path, columns, charts, self._export_info_rows())
                 message = (
                     f"Saved to:\n{path}\n\nSheets: Data (the table)"
-                    + (", Graph (chart from the Data sheet)" if chart else "")
+                    + "".join(f", {name} (chart from the Data sheet)" for name, _c in charts)
                     + ", Settings and fits."
                 )
         except OSError as exc:
@@ -6127,6 +6362,47 @@ class NdNkWindow(QDialog):
             "x_min": float(grid[0]),
             "x_max": float(grid[-1]),
             "series": series,
+            "note": f"Drawn from the Data sheet: the same curves as the app's {_ABS_GRAPH_TAB} tab.",
+        }
+
+    def _export_nk_chart_spec(
+        self, columns: list[tuple[str, np.ndarray]]
+    ) -> Optional[dict[str, object]]:
+        """The stored n1 and k1 (same axis) as an Excel chart."""
+        if self.nk_fit is None:
+            return None
+        headers = [header for header, _values in columns]
+        if not all(h in headers for h in ("Nk Wavelength (nm)", "Fitted n1", "Fitted k1")):
+            return None
+        wavelengths = np.asarray(self.nk_fit["wavelength"], dtype=np.float64)
+        # Blocks of rows without a wavelength gap (runs kept as separate
+        # segments): one series each, so Excel draws no line across a gap.
+        blocks = [(0, wavelengths.size)]
+        if wavelengths.size >= 3:
+            steps = np.diff(wavelengths)
+            cuts = (np.flatnonzero(steps > 1.5 * float(np.median(steps))) + 1).tolist()
+            edges = [0] + cuts + [wavelengths.size]
+            blocks = [(a, b - a) for a, b in zip(edges[:-1], edges[1:])]
+        series = [
+            {
+                "name": name, "color": "%02X%02X%02X" % _NK_PLOT_COLORS[key], "dashed": False,
+                "x_column": headers.index("Nk Wavelength (nm)"),
+                "y_column": headers.index(column),
+                "first": first,
+                "length": count,
+                "legend": block == 0,
+            }
+            for key, name, column in (("n1", "n₁", "Fitted n1"), ("k1", "k₁", "Fitted k1"))
+            for block, (first, count) in enumerate(blocks)
+        ]
+        return {
+            "title": "n₁ and k₁ vs wavelength",
+            "x_title": "Wavelength (nm)",
+            "y_title": "n₁ and k₁",
+            "x_min": float(np.nanmin(wavelengths)),
+            "x_max": float(np.nanmax(wavelengths)),
+            "series": series,
+            "note": f"Drawn from the Data sheet: the same curves as the app's {_NK_GRAPH_TAB} tab.",
         }
 
     def _export_info_rows(self) -> list[tuple[object, object, bool]]:
@@ -7391,6 +7667,7 @@ class NkFitDialog(QDialog):
         owner = self._owner
         owner.nk_fit = merged
         owner.nk_segments = []
+        owner._clear_nk_plot()  # a new stored result: plot it again in step 11
         self._shown_extra.clear()
         owner._refresh_table()
         fitted = int(np.isfinite(merged["n1"]).sum())
