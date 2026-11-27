@@ -5473,13 +5473,42 @@ class NdNkWindow(QDialog):
             self.nd_fit = None  # the Nd fit used step 7's values
             if self._nd_fit_dialog is not None:
                 self._nd_fit_dialog.results_cleared(had_fit)
-            had_nk = self.nk_fit is not None or bool(self.nk_segments)
+            had_nk = (
+                self.nk_fit is not None
+                or bool(self.nk_segments)
+                or (self._nk_fit_dialog is not None and self._nk_fit_dialog._run is not None)
+            )
             self.nk_fit = None  # so did the Nk runs and their stored result
             self.nk_segments = []
             if self._nk_fit_dialog is not None:
                 self._nk_fit_dialog.results_cleared(had_nk)
         self.plotted = False
         self._plot_widget.clear()
+
+    def _nk_d1_in_use(self) -> Optional[float]:
+        """d1 used by the Nk run in progress, the kept runs or the stored result."""
+        dialog = self._nk_fit_dialog
+        if dialog is not None and dialog._run is not None:
+            return float(dialog._run["d1"])
+        if self.nk_segments:
+            return float(self.nk_segments[0]["d1"])
+        if self.nk_fit is not None:
+            return float(self.nk_fit["d1"])
+        return None
+
+    def nd_d1_changed(self, old_d1: float, new_d1: float) -> None:
+        """A new Nd fit gave another d1: the Nk inputs changed, so its runs
+        (also one in progress) and its stored result are cleared."""
+        self.nk_fit = None
+        self.nk_segments = []
+        if self._nk_fit_dialog is not None:
+            self._nk_fit_dialog.results_cleared(
+                True,
+                f"d₁ changed in the Nd fit ({old_d1:.4f} → {new_d1:.4f} nm): Nk runs "
+                "and stored n₁, k₁ cleared.",
+            )
+        self._refresh_table()
+        self._update_footnotes()
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().showEvent(event)
@@ -5970,6 +5999,12 @@ class NdNkWindow(QDialog):
                 columns.append(
                     (f"{mode} Interpolated Relative Reflectance", self.relative_interp[mode])
                 )
+        if self.si_wavelength is not None:  # 5. imported Si values (right of step 4)
+            columns += [
+                ("Imported Si Wavelength (nm)", self.si_wavelength),
+                ("Imported Si n", self.si_n),
+                ("Imported Si k", self.si_k),
+            ]
         if self.si_interp is not None:  # 6. interpolated Si values
             columns += [
                 ("Si Interp Wavelength (nm)", self.si_interp["grid"]),
@@ -5983,17 +6018,12 @@ class NdNkWindow(QDialog):
             columns += [
                 (f"{mode} Absolute Reflectance", self.absolute[mode]) for mode in modes
             ]
-        if self.nk_fit is not None:  # 10. Nk fit
+        if self.nk_fit is not None:  # 10. Nk fit (d1 from the Nd fit: one value, one cell)
             columns += [
+                ("d1 (nm)", np.array([float(self.nk_fit["d1"])], dtype=np.float64)),
                 ("Nk Wavelength (nm)", self.nk_fit["wavelength"]),
                 ("Fitted n1", self.nk_fit["n1"]),
                 ("Fitted k1", self.nk_fit["k1"]),
-            ]
-        if self.si_wavelength is not None:  # 5. imported Si values
-            columns += [
-                ("Imported Si Wavelength (nm)", self.si_wavelength),
-                ("Imported Si n", self.si_n),
-                ("Imported Si k", self.si_k),
             ]
         self._model.set_columns(columns)
         self._shown_inputs = self._measurement_inputs()
@@ -6424,16 +6454,30 @@ class NdFitDialog(QDialog):
             QMessageBox.warning(self, "Nd Fit Failed", str(exc))
             return False
         result["source"] = table["source"]
-        self._owner.nd_fit = result
-        if self._owner._nk_fit_dialog is not None:
-            self._owner._nk_fit_dialog.nd_fit_changed()
+        owner = self._owner
+        nk_d1 = owner._nk_d1_in_use()  # d1 the Nk results were made with
+        owner.nd_fit = result
+        nk_reset = nk_d1 is not None and float(result["d1"]) != nk_d1
+        if nk_reset:
+            owner.nd_d1_changed(nk_d1, float(result["d1"]))
+        if owner._nk_fit_dialog is not None:
+            owner._nk_fit_dialog.nd_fit_changed()
         self._revision += 1
         self._show_result(result)
-        self._owner._update_footnotes()
-        self._owner._summary.setText(
+        owner._update_footnotes()
+        owner._summary.setText(
             f"Nd fit at {result['wavelength']:.3f} nm: n₁ = {result['n1']:.6f}, "
             f"d₁ = {result['d1']:.4f} nm (error {result['error']:.3e})."
+            + (" d₁ changed, so the Nk results were cleared." if nk_reset else "")
         )
+        if nk_reset:
+            QMessageBox.information(
+                self,
+                "Nk Results Cleared",
+                f"The new Nd fit gives d₁ = {result['d1']:.4f} nm (the Nk fit used "
+                f"{nk_d1:.4f} nm).\n\nNk uses d₁ as an input, so its runs and the "
+                "stored n₁ and k₁ were cleared. Run the Nk fit again with the new d₁.",
+            )
         return True
 
     # Output ------------------------------------------------------------
@@ -6514,6 +6558,7 @@ QListWidget#nkRunsList::indicator {
     border: 1px solid #5c6370; background-color: #1e2229;
 }
 QListWidget#nkRunsList::indicator:checked { border: 1px solid #4fc3f7; background-color: #4fc3f7; }
+QLineEdit#nkD1Field { background-color: #161a20; color: #c8ccd4; border: 1px dashed #3a414d; }
 """
 
 
@@ -6776,6 +6821,10 @@ class NkFitDialog(QDialog):
             grid.addWidget(edit, row, 1)
             row += 1
             if key == "d1":
+                # d1 comes from the Nd fit (step 9) only: one d1 for every run.
+                edit.setReadOnly(True)
+                edit.setObjectName("nkD1Field")
+                edit.setToolTip("d₁ comes from the Nd fit (step 9). Run the Nd fit again to change it.")
                 self._d1_source = QLabel("")
                 self._d1_source.setTextFormat(Qt.TextFormat.RichText)
                 self._d1_source.setWordWrap(True)
@@ -6915,10 +6964,9 @@ class NkFitDialog(QDialog):
     # Inputs ------------------------------------------------------------
 
     def nd_fit_changed(self) -> None:
-        """Fill in d1 from the latest Nd fit (it can still be typed over)."""
+        """Show d1 from the latest Nd fit (empty when there is none)."""
         fit = self._owner.nd_fit
-        if fit is not None:
-            self._edits["d1"].setText(f"{fit['d1']:.6f}")
+        self._edits["d1"].setText("" if fit is None else f"{fit['d1']:.6f}")
         self.refresh()
 
     def _grid(self) -> Optional[np.ndarray]:
@@ -6930,13 +6978,17 @@ class NkFitDialog(QDialog):
         problems: list[str] = []
         labels = {key: label for key, label, _default in self._FIELDS}
         for key, edit in self._edits.items():
+            if key == "d1":  # exactly the Nd fit's d1 (the box shows it rounded)
+                fit = self._owner.nd_fit
+                if fit is None:
+                    problems.append("d₁: run the Nd fit (step 9) first")
+                else:
+                    values["d1"] = float(fit["d1"])
+                continue
             try:
                 values[key] = float(edit.text().strip())
             except ValueError:
-                if key == "d1":
-                    problems.append("d₁: run the Nd fit (step 9), or type d₁ in nm")
-                else:
-                    problems.append(f"{labels[key]}: enter a number")
+                problems.append(f"{labels[key]}: enter a number")
         rules = (
             ("d1", lambda v: v > 0, "must be above 0"),
             ("n1_start", lambda v: v > 0, "must be above 0"),
@@ -6978,16 +7030,12 @@ class NkFitDialog(QDialog):
         if fit is not None:
             self._d1_source.setText(
                 f"<span style='color:{ready}'>From the Nd fit at "
-                f"{fit['wavelength']:.3f} nm: {fit['d1']:.4f} nm</span>"
-            )
-        elif self._edits["d1"].text().strip():
-            self._d1_source.setText(
-                "<span style='color:#8a93a3'>Not from a current Nd fit: the value "
-                "above is used as typed</span>"
+                f"{fit['wavelength']:.3f} nm.</span> <span style='color:#8a93a3'>A new "
+                "Nd fit with another d₁ clears the Nk runs.</span>"
             )
         else:
             self._d1_source.setText(
-                f"<span style='color:{needs}'>No Nd fit yet: run step 9, or type d₁</span>"
+                f"<span style='color:{needs}'>No Nd fit yet: run step 9 first</span>"
             )
         grid = self._grid()
         if grid is not None:
@@ -7118,8 +7166,8 @@ class NkFitDialog(QDialog):
 
     def _redraw_live(self) -> None:
         run = self._run
-        if run is None or not run["dirty"]:
-            return
+        if run is None or run.get("discard") or not run["dirty"]:
+            return  # (a discarded run's last points are not drawn)
         run["dirty"] = False
         done = run["done"]
         count = run["wavelength"].size
@@ -7334,6 +7382,7 @@ class NkFitDialog(QDialog):
         if not segments:
             return
         merged = _merge_nk_segments(segments)
+        merged["d1"] = float(segments[0]["d1"])  # one d1 for all runs (from the Nd fit)
         merged["mode"] = mode
         merged["runs"] = [
             {key: s[key] for key in ("id", "start", "end", "d1", "n1_start", "n1_range", "k1_start", "k1_range")}
@@ -7354,8 +7403,9 @@ class NkFitDialog(QDialog):
         self._redraw_saved()
         self.refresh()
 
-    def results_cleared(self, had_result: bool) -> None:
-        """Step 7's values changed: runs and the stored result no longer apply."""
+    def results_cleared(self, had_result: bool, message: Optional[str] = None) -> None:
+        """Step 7's values (or the Nd fit's d1) changed: runs and the stored
+        result no longer apply."""
         if self._thread is not None:
             self._thread.stop_requested = True
             if self._run is not None:
@@ -7364,12 +7414,14 @@ class NkFitDialog(QDialog):
         self._redraw_saved()
         self._progress_bar.setValue(0)
         self._progress_label.setText(
-            "The absolute reflectance changed, so the runs and the stored result "
+            message
+            if message is not None
+            else "The absolute reflectance changed, so the runs and the stored result "
             "were cleared."
             if had_result
             else "No fit running."
         )
-        self.refresh()
+        self.nd_fit_changed()  # d1 box follows the Nd fit (cleared with step 7)
 
 
 class SpectrometerAppWithNdNk(SpectrometerApp):
