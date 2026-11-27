@@ -4395,6 +4395,19 @@ def _xlsx_chart(chart: dict[str, object]) -> str:
         )
 
     x_limits = f'<c:max val="{chart["x_max"]!r}"/><c:min val="{chart["x_min"]!r}"/>'
+    y_limits = (
+        f'<c:max val="{float(chart["y_max"])!r}"/><c:min val="{float(chart["y_min"])!r}"/>'
+        if "y_min" in chart and "y_max" in chart else ""
+    )
+    # Optional black (or any colour) line around the plot area and the chart.
+    def outline(key: str) -> str:
+        color = chart.get(key)
+        if not color:
+            return ""
+        return (
+            f'<c:spPr><a:noFill/><a:ln w="12700"><a:solidFill><a:srgbClr val="{color}"/>'
+            "</a:solidFill></a:ln></c:spPr>"
+        )
     two_axes = bool(secondary_xml)
     # With a right-hand axis the plot is narrower so its labels don't hit the legend.
     plot_w, legend_x, legend_w = ("0.5", "0.74", "0.25") if two_axes else ("0.56", "0.69", "0.3")
@@ -4423,14 +4436,17 @@ def _xlsx_chart(chart: dict[str, object]) -> str:
         + '<c:axId val="500000001"/><c:axId val="500000002"/></c:scatterChart>'
         + second
         + axis(500000001, 500000002, "b", chart["x_title"], x_limits)
-        + axis(500000002, 500000001, "l", chart["y_title"], "")
+        + axis(500000002, 500000001, "l", chart["y_title"], y_limits)
         + second_axes
+        + outline("plot_border")
         + '</c:plotArea><c:legend><c:legendPos val="r"/>' + hidden_entries + '<c:layout><c:manualLayout>'
         f'<c:xMode val="edge"/><c:yMode val="edge"/><c:x val="{legend_x}"/><c:y val="0.12"/>'
         f'<c:w val="{legend_w}"/><c:h val="0.3"/></c:manualLayout></c:layout><c:overlay val="0"/>'
         '<c:txPr><a:bodyPr/><a:lstStyle/><a:p><a:pPr><a:defRPr sz="900"/></a:pPr>'
         '<a:endParaRPr lang="en-US"/></a:p></c:txPr></c:legend>'
-        '<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart></c:chartSpace>'
+        '<c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>'
+        + outline("chart_border")
+        + '</c:chartSpace>'
     )
 
 
@@ -4783,9 +4799,9 @@ class NdNkWindow(QDialog):
 
     @staticmethod
     def _grid_edit(default: float, placeholder: str) -> QLineEdit:
-        edit = QLineEdit(f"{default:.3f}")
+        edit = QLineEdit(_trim_number(default))  # whole numbers by default
         edit.setPlaceholderText(placeholder)
-        validator = QDoubleValidator(0.0, 5000.0, 3, edit)
+        validator = QDoubleValidator(0.0, 5000.0, 10, edit)  # any decimals can be typed
         validator.setNotation(QDoubleValidator.Notation.StandardNotation)
         validator.setLocale(QLocale.c())
         edit.setValidator(validator)
@@ -5109,6 +5125,10 @@ class NdNkWindow(QDialog):
             self._plot_widget.getAxis(axis).enableAutoSIPrefix(False)
         self._plot_widget.setLabel("bottom", "Wavelength (nm)")
         self._plot_widget.setLabel("left", "Reflectance")
+        # Fixed 0-1 reflectance axis: label every 0.1, including 0 and 1 at the edges.
+        self._plot_widget.getAxis("left").setTicks(
+            [[(v / 10, f"{v / 10:.1f}") for v in range(11)], []]
+        )
         self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
         # Legend in the top-right corner, on a solid box so curves behind it
         # don't make it hard to read. Clicking an entry hides / shows its curve.
@@ -5478,7 +5498,7 @@ class NdNkWindow(QDialog):
         )
         if self.nd_fit is not None:
             fit_text = (
-                f"Last fit at {self.nd_fit['wavelength']:.3f} nm: n₁ = "
+                f"Last fit at {_trim_number(self.nd_fit['wavelength'])} nm: n₁ = "
                 f"{self.nd_fit['n1']:.6f}, d₁ = {self.nd_fit['d1']:.4f} nm."
             )
         else:
@@ -5772,7 +5792,7 @@ class NdNkWindow(QDialog):
             note = " The grid changed, so the interpolated Si values were cleared (redo step 6)."
         return self._step_done(
             f"Relative reflectance interpolated onto {grid.size} points "
-            f"({grid[0]:.3f}–{grid[-1]:.3f} nm, step {grid[1] - grid[0]:.3f} nm, {method}).{note}"
+            f"({_trim_number(grid[0])}–{_trim_number(grid[-1])} nm, step {_trim_number(grid[1] - grid[0])} nm, {method}).{note}"
         )
 
     def _interpolate_si(self) -> bool:
@@ -5799,7 +5819,7 @@ class NdNkWindow(QDialog):
         where = "the reflectance grid" if same else "its own grid"
         return self._step_done(
             f"Si n and k interpolated onto {where}: {grid.size} points "
-            f"({grid[0]:.3f}–{grid[-1]:.3f} nm, {method})."
+            f"({_trim_number(grid[0])}–{_trim_number(grid[-1])} nm, {method})."
         )
 
     def _calculate_absolute(self) -> bool:
@@ -5856,7 +5876,7 @@ class NdNkWindow(QDialog):
             curve.setZValue(z)  # sample curves on top of the Si curves
             # Refit the axes when a curve is hidden or shown from the legend.
             curve.visibleChanged.connect(self._refit_plot)
-        self._plot_widget.enableAutoRange()
+        self._refit_plot()
         self.plotted = True
         self._results_tabs.setCurrentIndex(1)
         self._update_footnotes()
@@ -5865,10 +5885,14 @@ class NdNkWindow(QDialog):
         )
 
     def _refit_plot(self) -> None:
-        """Fit the axes to the curves that are visible (after a legend click)."""
+        """Fit the wavelength axis to the visible curves (after a legend click);
+        the reflectance axis stays 0 to 1."""
         view = self._plot_widget.getViewBox()
-        view.enableAutoRange()
+        view.enableAutoRange(axis=pg.ViewBox.XAxis)
         view.updateAutoRange()
+        view.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        # 0 to 1, with a sliver of room so the 0 and 1.0 labels are not cut off.
+        view.setYRange(0.0, 1.0, padding=0.02)
 
     def _clear_nk_plot(self) -> None:
         """Remove step 11's curves (the stored n1 / k1 changed or was cleared)."""
@@ -6163,14 +6187,14 @@ class NdNkWindow(QDialog):
         }
         if not np.isfinite(wavelength) or wavelength < grid[0] - 1e-9 or wavelength > grid[-1] + 1e-9:
             raise ValueError(
-                f"Pick a wavelength between {grid[0]:.3f} and {grid[-1]:.3f} nm "
+                f"Pick a wavelength between {_trim_number(grid[0])} and {_trim_number(grid[-1])} nm "
                 "(the step 4 grid)."
             )
         hit = np.flatnonzero(np.abs(grid - wavelength) <= 1e-6)
         if hit.size:
             index = int(hit[0])
             values = {key: float(array[index]) for key, array in series.items()}
-            source = f"from the table at {grid[index]:.3f} nm"
+            source = f"from the table at {_trim_number(grid[index])} nm"
         else:
             right = int(np.searchsorted(grid, wavelength))
             left = right - 1
@@ -6179,8 +6203,8 @@ class NdNkWindow(QDialog):
                 for key, array in series.items()
             }
             source = (
-                f"interpolated between the table rows at {grid[left]:.3f} and "
-                f"{grid[right]:.3f} nm"
+                f"interpolated between the table rows at {_trim_number(grid[left])} and "
+                f"{_trim_number(grid[right])} nm"
             )
         missing = [
             name for key, name in (("r0", "R₀"), ("r60", "R₆₀"), ("n2", "Si n"), ("k2", "Si k"))
@@ -6335,7 +6359,8 @@ class NdNkWindow(QDialog):
         if names["x"] not in headers:
             return None
         grid = np.asarray(self.absolute["grid"])
-        colors = {mode: "%02X%02X%02X" % self._PLOT_COLORS[mode] for mode in ("R0", "R60")}
+        # Excel chart (white page): R0 black, R60 red; absolute solid, bare Si dashed.
+        colors = {"R0": "000000", "R60": "FF0000"}
         series = []
         for key, label, mode, dashed in (
             ("R0", "R₀ absolute (0°)", "R0", False),
@@ -6361,6 +6386,10 @@ class NdNkWindow(QDialog):
             "y_title": "Reflectance",
             "x_min": float(grid[0]),
             "x_max": float(grid[-1]),
+            "y_min": 0.0,
+            "y_max": 1.0,
+            "plot_border": "000000",
+            "chart_border": "000000",
             "series": series,
             "note": f"Drawn from the Data sheet: the same curves as the app's {_ABS_GRAPH_TAB} tab.",
         }
@@ -6742,7 +6771,7 @@ class NdFitDialog(QDialog):
         self._show_result(result)
         owner._update_footnotes()
         owner._summary.setText(
-            f"Nd fit at {result['wavelength']:.3f} nm: n₁ = {result['n1']:.6f}, "
+            f"Nd fit at {_trim_number(result['wavelength'])} nm: n₁ = {result['n1']:.6f}, "
             f"d₁ = {result['d1']:.4f} nm (error {result['error']:.3e})."
             + (" d₁ changed, so the Nk results were cleared." if nk_reset else "")
         )
@@ -6773,7 +6802,7 @@ class NdFitDialog(QDialog):
         n1_end = result["n1_start"] + result["n1_range"]
         d1_end = result["d1_start"] + result["d1_range"]
         self._output_details.setText(
-            f"At {result['wavelength']:.3f} nm: R₀, R₆₀ and Si n₂, k₂ "
+            f"At {_trim_number(result['wavelength'])} nm: R₀, R₆₀ and Si n₂, k₂ "
             f"{result.get('source', 'from the table')}. "
             f"Searched n₁ {result['n1_start']:g}–{n1_end:g} and d₁ "
             f"{result['d1_start']:g}–{d1_end:g} nm, k₁ = {result['k1']:g}, "
@@ -6870,6 +6899,12 @@ def _merge_nk_segments(segments: list[dict[str, object]]) -> dict[str, np.ndarra
         out["n1_edge"][i] = segment["n1_edge"][row]
         out["k1_edge"][i] = segment["k1_edge"][row]
     return out
+
+
+def _trim_number(value: float) -> str:
+    """350.0 -> "350", 0.5 -> "0.5": no trailing zeros, no exponent."""
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text
 
 
 def _plain_number(value: float) -> str:
@@ -7306,7 +7341,7 @@ class NkFitDialog(QDialog):
         if fit is not None:
             self._d1_source.setText(
                 f"<span style='color:{ready}'>From the Nd fit at "
-                f"{fit['wavelength']:.3f} nm.</span> <span style='color:#8a93a3'>A new "
+                f"{_trim_number(fit['wavelength'])} nm.</span> <span style='color:#8a93a3'>A new "
                 "Nd fit with another d₁ clears the Nk runs.</span>"
             )
         else:
